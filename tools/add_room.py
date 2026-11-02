@@ -51,7 +51,7 @@ common_event_args:
 download_args:
   dltype: live
   url: '{url}'
-  output_dir: ./直播回放/{name}
+  output_dir: ./直播回放/原视频/{name}
   output_name: '{{STREAMER.NAME}}-{{CTIME.YEAR}}年{{CTIME.MONTH:02d}}月{{CTIME.DAY:02d}}日{{CTIME.HOUR:02d}}点{{CTIME.MINUTE:02d}}分'
 """
 

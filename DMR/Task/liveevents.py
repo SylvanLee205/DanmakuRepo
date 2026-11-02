@@ -16,6 +16,7 @@ from ..state import (
     rebuild_video_info,
 )
 from ..utils import *
+from ..paths import danmaku_dir_for
 
 #: 内存状态槽位（``state_dict`` 的 ``vtype``）到持久化产物种类的映射。
 #: 槽位名沿用 ``VideoInfo.dtype`` 的历史命名，产物种类则是持久化层的枚举。
@@ -331,7 +332,8 @@ class LiveEvents(BaseEvents):
                 if render_args.get('output_dir'):
                     output_dir = render_args.get('output_dir')
                 else:
-                    output_dir = os.path.dirname(video.path) + '（弹幕版）'
+                    # 新布局：直播回放/原视频/<主播>/ -> 直播回放/弹幕版/<主播>/
+                    output_dir = danmaku_dir_for(video.path)
                 output = os.path.join(output_dir, filename)
             except Exception as e:
                 self.logger.warning(f'计算弹幕版输出路径失败，跳过 {video.path}: {e}')
@@ -721,7 +723,7 @@ class LiveEvents(BaseEvents):
             if render_args.get('output_dir'):
                 output_dir = render_args.get('output_dir')
             else:
-                output_dir = os.path.dirname(video.path) + '（弹幕版）'
+                output_dir = danmaku_dir_for(video.path)
             output = os.path.join(output_dir, filename)
             render_msg = PipeMessage(
                 source=self.name,

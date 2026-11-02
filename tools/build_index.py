@@ -1,6 +1,7 @@
 """生成录播索引页（单文件 HTML，双击就能看）。
 
-扫「直播回放/*（弹幕版）/」下的成品，按主播和日期整理成一个网页：
+扫「直播回放/弹幕版/<主播>/」下的成品（老布局 ``<主播>（弹幕版）`` 也认），
+按主播和日期整理成一个网页：
 搜主播、筛日期、点开就播放。**不依赖网络**（CSS/JS 全内嵌）。
 
 为什么用网页而不是 Excel/清单：
@@ -114,36 +115,50 @@ def parse_time(name: str):
 def collect(recordings_root: str):
     """扫描所有弹幕版产物。
 
-    兼容两种布局：
-        <root>/<主播>（弹幕版）/*.mp4
-        <root>/<主播>/*（弹幕版）*.mp4
+    兼容三种布局（2026-11-02 起统一到第一种）：
+        <root>/弹幕版/<主播>/*.mp4          ← 新布局
+        <root>/<主播>（弹幕版）/*.mp4        ← 老布局
+        <root>/<主播>/*（弹幕版）*.mp4       ← 更早的版本
     """
     items = []
     if not os.path.isdir(recordings_root):
         return items
 
-    for entry in os.listdir(recordings_root):
+    for entry in sorted(os.listdir(recordings_root)):
         full = os.path.join(recordings_root, entry)
         if not os.path.isdir(full):
             continue
+
+        if entry == '弹幕版':
+            # 新布局：<root>/弹幕版/<主播>/*.mp4
+            for sub in sorted(os.listdir(full)):
+                subfull = os.path.join(full, sub)
+                if not os.path.isdir(subfull):
+                    continue
+                for name in sorted(os.listdir(subfull)):
+                    if not name.lower().endswith(VIDEO_EXT):
+                        continue
+                    path = os.path.join(subfull, name)
+                    if os.path.isfile(path):
+                        items.append(_mk_item(path, sub, name))
+            continue
+
         if DM_MARK in entry:
             streamer = entry.replace(DM_MARK, '').strip()
-            for name in os.listdir(full):
+            for name in sorted(os.listdir(full)):
                 if not name.lower().endswith(VIDEO_EXT):
                     continue
                 path = os.path.join(full, name)
-                if not os.path.isfile(path):
-                    continue
-                items.append(_mk_item(path, streamer, name))
+                if os.path.isfile(path):
+                    items.append(_mk_item(path, streamer, name))
         else:
             streamer = entry
-            for name in os.listdir(full):
+            for name in sorted(os.listdir(full)):
                 if DM_MARK not in name or not name.lower().endswith(VIDEO_EXT):
                     continue
                 path = os.path.join(full, name)
-                if not os.path.isfile(path):
-                    continue
-                items.append(_mk_item(path, streamer, name))
+                if os.path.isfile(path):
+                    items.append(_mk_item(path, streamer, name))
 
     items.sort(key=lambda x: (x['sort'], x['streamer']), reverse=True)
     return items

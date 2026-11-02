@@ -33,6 +33,7 @@ import shutil
 import time
 
 from .paths import p, data_root, TEMP
+from .paths import DANMAKU_SUBDIR, danmaku_dir_for, source_root
 
 __all__ = ('Maintenance', 'is_disk_emergency')
 
@@ -278,20 +279,45 @@ class Maintenance:
                        '  1) 把「弹幕版」移到别的盘或网盘',
                        '  2) 或设 DMR_DATA_ROOT 指向更大的盘'])
 
+    def _has_danmaku(src_dir: str, dm_base: str) -> bool:
+        """源视频有没有对应的弹幕版产物（新/老两种布局都认）。
+
+        ``dm_base`` 形如 ``xxx（弹幕版）``，命中判据是"前缀 + 扩展名"，
+        不用 ``startswith(stem)`` —— 后者在 stem 很短时会误匹配到别的文件。
+        """
+
+        def _in(d):
+            try:
+                return any(n.startswith(dm_base) and n[len(dm_base):].startswith('.')
+                           for n in os.listdir(d))
+            except OSError:
+                return False
+
+        # 新布局：直播回放/弹幕版/<主播>/
+        if _in(danmaku_dir_for(src_dir)):
+            return True
+        # 老布局（未迁移）：<主播>（弹幕版）/ 与 <主播>/ 平级，成品也可能就
+        # 躺在源目录里（更早的版本确实是这样）
+        return _in(src_dir)
+
     def emergency_clean(self, max_free_gb: float, logger=None) -> float:
         """删除「已经渲染出弹幕版」的最旧源视频，直到释放到目标水位。
 
         安全规则（每一条都来自真实事故）：
           * 跳过 ``[正在录制]`` 前缀 —— 那是正在写的文件
           * 跳过 .part/.ass/.xml 等中间产物
-          * 必须有同目录的 ``xxx（弹幕版）.mp4`` 才允许删（说明已渲染完）
+          * 必须有对应的 ``xxx（弹幕版）.mp4`` 才允许删（说明已渲染完）
+            ⚠️ 2026-11-02 新布局下成品在 ``直播回放/弹幕版/<主播>/``，
+            **不再是同目录**，所以这里要去成品目录里找，不能只看当前目录
           * 只删超过 2 小时没动过的（防正在读）
           * 从最旧的开始删，够了就停
 
         返回释放的 GB 数。
         """
         logger = logger or self.logger
-        root = os.path.join(data_root(), '直播回放')
+        # 只扫源视频：新布局下就是 直播回放/原视频/；老布局（未迁移）退回
+        # 直播回放/，那时必须显式跳过 弹幕版/ 分类目录和 <主播>（弹幕版）/。
+        root = source_root()
         if not os.path.isdir(root):
             root = os.path.join(p(), '直播回放')
         if not os.path.isdir(root):
@@ -299,7 +325,10 @@ class Maintenance:
 
         cands = []
         for dirpath, _dirs, files in os.walk(root):
-            names = set(files)
+            # 老布局兜底：任何成品目录都不参与"删源视频"的候选
+            if DANMAKU_SUBDIR in os.path.normpath(dirpath).split(os.sep) \
+                    or _DM_MARK in os.path.basename(dirpath):
+                continue
             for name in files:
                 if name.startswith(_RECORDING_PREFIX):
                     continue
@@ -317,8 +346,7 @@ class Maintenance:
                 # 后者在 stem 很短时会误匹配到别的文件。
                 stem, ext = os.path.splitext(name)
                 dm_base = f'{stem}{_DM_MARK}'
-                if not any(n.startswith(dm_base) and n[len(dm_base):].startswith('.')
-                           for n in names):
+                if not self._has_danmaku(dirpath, dm_base):
                     continue
                 path = os.path.join(dirpath, name)
                 try:

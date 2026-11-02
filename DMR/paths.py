@@ -21,7 +21,10 @@ import sys
 __all__ = (
     'ROOT', 'TOOLS', 'CONFIGS', 'LOGS', 'TEMP', 'BACKUPS', 'DOCS',
     'RECORDINGS', 'SYSTEM32', 'is_frozen',
+    'SOURCE_SUBDIR', 'DANMAKU_SUBDIR', 'DM_MARK',
     'p', 'ensure', 'enter_root', 'system32', 'powershell_exe',
+    'recordings_root', 'source_root', 'danmaku_root',
+    'streamer_of', 'danmaku_dir_for', 'is_danmaku_path',
     'snapshot_dir', 'backup_dir', 'release_dir', 'data_root',
 )
 
@@ -95,6 +98,86 @@ BACKUPS = os.path.join(ROOT, 'backups')
 DOCS = os.path.join(ROOT, 'docs')
 #: 默认录制输出根目录（每个任务的实际目录由配置里的 output_dir 决定）
 RECORDINGS = os.path.join(ROOT, '直播回放')
+
+#: 录制根下的两个分类子目录（2026-11-02 新布局）
+#:     直播回放/原视频/<主播>/   源视频 + 弹幕 .ass
+#:     直播回放/弹幕版/<主播>/   渲染后的成品
+#: 为什么要分两级：原来源目录和 `<主播>（弹幕版）` 平级混在 直播回放/ 里，
+#: 主播一多就分不清哪个是源哪个是成品。现在根目录下永远只有两个分类目录。
+SOURCE_SUBDIR = '原视频'
+DANMAKU_SUBDIR = '弹幕版'
+
+#: 成品**文件名**后缀。⚠️ 这个不能改：Cleaner 里"弹幕版永不删除"的硬保护
+#: 判据就是路径里含这个标记（见 DMR/Cleaner/__init__.py 的
+#: ``is_dm_video_path``）。目录怎么搬都行，文件名必须留着它。
+DM_MARK = '（弹幕版）'
+
+
+def recordings_root(base=None) -> str:
+    """录制根目录 ``<data_root>/直播回放``。"""
+    base = base or data_root()
+    return os.path.join(base, '直播回放')
+
+
+def source_root(base=None) -> str:
+    """源视频根 ``<data_root>/直播回放/原视频``。
+
+    老机器上这个子目录可能还不存在（未迁移）或已归档，此时退回录制根 ——
+    调用方按"找不到就当没数据"处理，不会误判成别的目录。
+    """
+    p = os.path.join(recordings_root(base), SOURCE_SUBDIR)
+    return p if os.path.isdir(p) else recordings_root(base)
+
+
+def danmaku_root(base=None, create=False) -> str:
+    """成品根 ``<data_root>/直播回放/弹幕版``（不存在时按需创建）。"""
+    p = os.path.join(recordings_root(base), DANMAKU_SUBDIR)
+    if create:
+        os.makedirs(p, exist_ok=True)
+    return p
+
+
+def streamer_of(path_or_dir: str) -> str:
+    """从源/成品路径里取出主播目录名（去掉 ``（弹幕版）`` 后缀）。
+
+    两种布局都能正确解析：
+        直播回放/原视频/小鱼大王/xxx.ts              -> 小鱼大王
+        直播回放/小鱼大王（弹幕版）/xxx（弹幕版）.mp4 -> 小鱼大王
+    """
+    s = str(path_or_dir or '').strip()
+    if not s:
+        return ''
+    name = os.path.basename(os.path.normpath(s))
+    return name.replace(DM_MARK, '').strip()
+
+
+def danmaku_dir_for(src_path_or_dir: str, base=None) -> str:
+    """源视频（或其所在目录）→ 成品应放的目录。
+
+    新布局：``直播回放/原视频/<主播>/`` → ``直播回放/弹幕版/<主播>/``
+    老布局：``直播回放/<主播>/``        → ``直播回放/弹幕版/<主播>/``
+
+    两种都归到同一个地方，所以**某个任务配置没跟着改也不会放错位置**。
+    """
+    d = str(src_path_or_dir or '')
+    # 传进来的是文件路径时先取其所在目录
+    if os.path.splitext(d)[1]:
+        d = os.path.dirname(d)
+    d = os.path.normpath(d)
+    parent = os.path.dirname(d)
+    if os.path.basename(parent) == SOURCE_SUBDIR:
+        base = os.path.dirname(parent)      # 录制备份/自定义根时也能对上
+    else:
+        base = base or recordings_root()
+    return os.path.join(base, DANMAKU_SUBDIR, streamer_of(d))
+
+
+def is_danmaku_path(path: str) -> bool:
+    """路径是不是弹幕版产物（判据：路径里含 ``（弹幕版）``）。"""
+    try:
+        return DM_MARK in os.path.normpath(str(path or ''))
+    except Exception:                                          # noqa: BLE001
+        return False
 
 
 def p(*parts: str) -> str:

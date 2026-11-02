@@ -48,7 +48,36 @@ def _log(msg: str) -> None:
 
 
 def running_pids() -> list:
-    r = subprocess.run(['powershell', '-NoProfile', '-Command', DMR_Q],
+    """找出正在跑的 DMR 主进程。
+
+    2026-11-02：原来用 ``subprocess.run(['powershell', ...])``，而 powershell
+    并不总在 PATH 上（venv 进程 / 某些 shell / 精简环境）。一旦
+    FileNotFoundError，本函数抛异常 → ``main()`` 按"检测失败=跳过启动"
+    处理 → **DMR 永远起不来**，而日志里只有一行"进程检测失败"。
+    当天迁移目录后重启就栽在这里。
+
+    psutil 本来就是 requirements.txt 里的依赖，不依赖任何外部可执行文件；
+    万一它没装，才回退到绝对路径调 PowerShell（见 DMR.paths.powershell_exe）。
+    """
+    try:
+        import psutil
+    except ImportError:
+        psutil = None
+
+    if psutil is not None:
+        out = []
+        for p in psutil.process_iter(['pid', 'name', 'cmdline']):
+            try:
+                if (p.info['name'] or '').lower() != 'python.exe':
+                    continue
+                if any('main.py' in (a or '') for a in (p.info['cmdline'] or [])):
+                    out.append(p.info['pid'])
+            except Exception:
+                continue
+        return out
+
+    from DMR.paths import powershell_exe
+    r = subprocess.run([powershell_exe(), '-NoProfile', '-Command', DMR_Q],
                        capture_output=True, text=True, encoding='utf-8',
                        errors='replace', timeout=60)
     out = (r.stdout or '').strip()
