@@ -1,6 +1,6 @@
 # tools 目录索引
 
-92 个脚本。**按用途分组**，不按字母序 —— 找东西时按"我要干什么"翻。
+52 个脚本。**按用途分组**，不按字母序 —— 找东西时按"我要干什么"翻。
 
 约定：**凡是会改文件/删文件的，默认都是预览模式**，加 `--apply` / `--force`
 才真动手。不确定就先裸跑一次看它打算做什么。
@@ -102,33 +102,18 @@ CD2 挂载盘方案已于 2026-11-02 废弃（上传改走 rclone 直传，
 |---|---|
 | `check_imports.py` | 模块导入完整性 + 真实清理测试 |
 | `check_undefined_names.py` | 未定义名字（AST + 运行时） |
-| `audit_undefined_names.py` | 同上，另一套实现 |
 | `check_critical_names.py` | 关键名字是否可获取（防渲染/上传静默失败） |
 | `audit_configs.py` | 配置审计 |
-| `audit_startup_chain.py` | 启动链审计（三层自启是否正确） |
-| `audit_orphan_methods.py` | 找出"定义了但没人调用"的方法 |
-| `full_audit.py` | 全面审计 |
 | `health_check.py` / `selfcheck.py` | 快速健康检查 |
-| `feature_audit.py` | 功能开关审计 |
-| `regression_check.py` | 回归检查（跑一遍关键流程） |
+| `doctor.py` | **一键体检**（`Doctor.bat` 调它，`--export` 出诊断包） |
 
 ## 九、日志与诊断
 
 | 脚本 | 干什么 |
 |---|---|
-| `analyze_console_volume.py` | 分析日志噪音来源 |
 | `explain_log_levels.py` | 解释各级别日志的含义 |
 | `check_dmr_alive.py` | 进程是否活着 |
 | `check_recordings.py` | 录制产物检查 |
-| `check_danmaku_file.py` | `.ass` 文件检查 |
-| `check_skip_rule.py` | 跳过上传规则验证 |
-| `check_flv_overlap.py` | FLV 分段是否重叠 |
-| `check_orphan_flv.py` | 孤儿 FLV 检查 |
-| `compare_duplicates.py` | 重复文件 |
-| `compare_orphan3.py` / `deep_name_scan.py` | 名字/孤儿深度扫描 |
-| `trace_flv_rename.py` | 追踪 FLV 改名链路 |
-| `trace_missing_render.py` | 追踪"没有弹幕版"的分段 |
-| `diag_stuck_recording.py` | 录制卡住诊断 |
 | `prescan.release.py` | 发布前扫描（脱敏检查） |
 | `make_handover_bundle.py` | **一键生成瘦身交接包**（含完整 git 历史 + 脱敏配置，约 7MB） |
 
@@ -137,11 +122,10 @@ CD2 挂载盘方案已于 2026-11-02 废弃（上传改走 rclone 直传，
 这些**不是单元测试**（单元测试在 `unit_tests/`，用 unittest 跑）。
 它们是"想看某个功能到底通不通"时手动执行的，会真的动文件/网络：
 
-`test_baidu_upload` `test_clean_order` `test_danmaku_pairing` `test_dm_type`
-`test_dual_upload` `test_emoji_cmd` `test_emoji_name` `test_pending_clean`
-`test_rclone_upload` `test_skip_upload` `test_skip_upload_config`
-`test_skip_upload_flow` `test_startup` `test_task_error_converge`
-`test_truncation` `test_upload_decoupled` `test_upload_e2e`
+`test_hwdecode` `test_render_encoder` `test_render_withsubs`
+
+（其余针对具体 bug 的一次性验证脚本已于 2026-11-03 清理，
+需要时用 `git log --diff-filter=D --name-only -- tools/` 找回。）
 
 ---
 

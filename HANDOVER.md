@@ -35,7 +35,7 @@
 3. `docs/project_state.md` —— 当前状态与设计取舍
 4. `README.md` —— 怎么用、一键脚本清单、常见问题表
 
-工具脚本索引在 `tools/README.md`（**92 个脚本**，按"我要干什么"分组，不按字母序）。
+工具脚本索引在 `tools/README.md`（**52 个脚本**，按"我要干什么"分组，不按字母序）。
 
 ---
 
@@ -203,7 +203,7 @@ python tools\check_undefined_names.py        :: 未定义名字
 
 | 方式 | 命令 | 说明 |
 |---|---|---|
-| **瘦身包（推荐）** | `python tools\make_handover_bundle.py` | 出 `F:\DanmakuRepo-交接-<时间戳>.zip`，约 **7 MB / 1550 文件**，含完整 git 历史（80 提交）、全部文档、源码、工具脚本、脱敏后的任务配置。自动自检"包内无明文 key" |
+| **瘦身包（推荐）** | `python tools\make_handover_bundle.py` | 出 `F:\DanmakuRepo-交接-<时间戳>.zip`，约 **4.2 MB / 505 文件**，含完整 git 历史、全部文档、源码、工具脚本、脱敏后的任务配置。自动自检"包内无明文 key" |
 | 直接给文件夹 | `python tools\make_handover_bundle.py --out-dir D:\handover` | 同上但解压成目录，本地给 AI 读更方便 |
 | 只给仓库 | clone `github.com/SylvanLee205/DanmakuRepo` | 只有代码，**不含 configs/**（用户配置不入库）、不含状态库 |
 

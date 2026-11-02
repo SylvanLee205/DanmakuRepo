@@ -547,3 +547,58 @@ CD2 可能吞数据但 rclone 退出码 0 → DMR 误判成功。`DMR_云端上�
 - 重启实测多次：60s 优雅超时内自退、5s 新实例就位、零孤儿分段
 - 通知实测发送成功（手机收到）
 - 端到端遗留：等下次真实开播，确认新录像落 `原视频/<主播>/`、成品落 `弹幕版/<主播>/`
+
+---
+
+## 2026-11-03 凌晨 · 交接体系建设 + 旧产物大清理
+
+> 用户额度用完、准备换 AI 接手 → 目标：**让项目文件夹本身自解释**，
+> 接手方（或 AI）检索一遍就知道来龙去脉，且不会被过时文件误导。
+
+### 1. 交接体系（三个新文件）
+
+| 文件 | 给谁看 | 作用 |
+|---|---|---|
+| `HANDOVER.md`（仓库根） | 人 | 完整交接：状态快照、架构地图、**12 条铁律**、坑速查表、待办、命令速查、红线 |
+| `AGENTS.md`（仓库根） | AI | Codex / Cursor / Claude Code / Cline 等**会自动读**仓库根的 AGENTS.md → 把"先读哪三份文档、绝对不要做什么"写进去 |
+| `tools/make_handover_bundle.py` | 两者 | 一键出**瘦身交接包**：4.2 MB / 505 文件，含完整 git 历史 + 文档 + 源码 + 脱敏配置，自动排除录播/venv/exe/登录态，打包后自检"无明文 key" |
+
+README 顶部与「〇、项目文件地图」一节给出**哪是活的、哪是历史**的分层，
+`docs/archive/README.md` 给归档的 10 份文档做索引（每份是什么、什么时候看）。
+
+### 2. 旧产物大清理
+
+| 删了什么 | 数量 | 判断依据 |
+|---|---|---|
+| tools/ 一次性诊断与对比脚本 | 40 | 全仓 grep 无引用，且被 `check_imports` / `doctor` 等现役工具取代 |
+| tools/ 一次性 `test_*.py` | 17 | 验证的是具体历史 bug；保留长期有用的 `test_render_encoder` / `test_render_withsubs` / `test_hwdecode` |
+| docs/archive 过时文档 | 13 | 旧 README 副本、CD2 方案文档、**已被 HANDOVER.md 取代的旧交接文档**、重复的日志错误报告 |
+| 根目录残留 | 3 | `notify_title.txt` / `notify_content.txt`（旧固定文件通知机制的遗留）、`Dockerfile`（上游遗留且版本过时） |
+| 早期日志 | 4 天 | 10-19~10-30 的日志原文，结论已归档进 `docs/archive/` |
+
+**保留原则**（用户明确）：代码自带逻辑 + **实测记录** + **踩过的坑** + git 历史。
+所以 `docs/archive/` 只剩 10 份"事故复盘 / 排查记录 / 复查报告 / 规范"，
+每份都在 `archive/README.md` 里有索引说明。
+
+⚠️ 删前全部用 `git rm`（历史可找回：`git log --diff-filter=D --name-only -- tools/`）。
+
+### 3. 顺手修掉一个真 bug：失败渲染清单里的僵尸条目
+
+现象：`.temp/failed_renders.json` 里 11 条 `rendering` 状态的记录，
+源视频**全部不存在**（用户归档了录播 + 目录迁移），却永远清不掉。
+
+根因：`load_failed_tasks()` 把清单全量加载进内存，之后 `save_failed_tasks()`
+每次都**原样写回** —— 手工清空文件也会被写回来，永远清不掉；
+Web 界面的"失败渲染"列表也永远显示这堆不存在的东西。
+
+修法：加载时逐条校验 `video.path` 是否在磁盘上，不存在就丢弃并立即落盘。
+重启后实测：`丢弃 11 条源视频已不存在的失败渲染记录` → 清单归零。
+
+### 4. 顺带修掉：通知凭据硬编码在公开仓库里
+
+`DMR/notify.py` 里 Server酱 key 是硬编码常量，而该文件在**公开仓库**
+`SylvanLee205/DanmakuRepo` 里。改为按优先级读 `.login_info/notify_key.txt`
+→ 环境变量 `DMR_SCT_KEY` → `configs/global.yml` 的 `notify.sct_key`；
+同时删掉同样带 key 的一次性脚本 `tools/update_bat_dynamic_notify.py`，
+`doctor.py` 的通知自检改读实际端点。**旧 key 仍需去 Server酱³ 后台重置**
+（历史里那份要作废）。

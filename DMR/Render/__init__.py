@@ -39,13 +39,35 @@ class Render():
             try:
                 with open(self.failed_tasks_file, 'r', encoding='utf-8') as f:
                     data = json.load(f, cls=DateTimeDecoder)
+                    dropped = 0
                     for uuid, task in data.items():
                         if task.get('video'):
-                            task['video'] = VideoInfo(**task['video'])
+                            # ⚠️ 2026-11-03：源视频已不在磁盘上的条目是**僵尸**。
+                            #   怎么产生的：用户把录播归档走了，或目录结构迁移过
+                            #   （2026-11-02 换成 原视频/ + 弹幕版/ 布局）。
+                            #   为什么必须在这里清掉：
+                            #     ① 留着它们，Web 界面的"失败渲染"列表永远显示
+                            #        一堆已经不存在的东西；
+                            #     ② 更糟 —— save_failed_tasks() 每次都会把内存里
+                            #        这份清单**原样写回文件**，所以手工清空文件
+                            #        也会在下次保存时被写回来，永远清不掉。
+                            #   判据：video 里的 path 在磁盘上不存在 → 丢弃。
+                            raw = task['video']
+                            path = raw.get('path') if isinstance(raw, dict) \
+                                else getattr(raw, 'path', None)
+                            if path and not os.path.exists(path):
+                                dropped += 1
+                                continue
+                            task['video'] = VideoInfo(**raw)
                             # Update config as well
                             # if 'config' in task and 'video' in task['config']:
                             #     task['config']['video'] = task['video']
                         self.failed_tasks[uuid] = task
+                if dropped:
+                    # 立刻落盘，把僵尸从文件里真正抹掉
+                    self.logger.info(f'丢弃 {dropped} 条源视频已不存在的失败渲染记录'
+                                     f'（录播被归档或目录迁移所致）。')
+                    self.save_failed_tasks()
                 self.logger.info(f'Loaded {len(self.failed_tasks)} failed render tasks.')
             except Exception as e:
                 # ⚠️ 2026-11-02：加载失败必须把坏文件挪走。
