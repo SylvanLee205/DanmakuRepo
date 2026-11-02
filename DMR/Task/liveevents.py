@@ -141,8 +141,14 @@ class LiveEvents(BaseEvents):
                     if not ok:
                         # ⚠️ send() 失败时**不抛异常**（设计如此，通知不该拖垮录制），
                         #    但必须留日志，否则"没收到通知"永远查不到原因。
-                        self.logger.warning('%s: 开播通知发送失败（Server酱未返回 code:0）',
-                                            self.name)
+                        #    把 notify.last_error 一起打出来 —— 否则只知道"失败了"，
+                        #    不知道是超时、额度用完还是服务端报错。
+                        try:
+                            from DMR.notify import last_error as _le
+                        except Exception:
+                            _le = '?'
+                        self.logger.warning('%s: 开播通知发送失败 —— %s',
+                                            self.name, _le)
                 except Exception as _e:
                     self.logger.warning('%s: 开播通知异常: %r', self.name, _e)
 

@@ -37,7 +37,12 @@ def system32(name: str) -> str:
         计划任务（session 0）和某些精简过的环境 PATH 里**没有** System32，
         2026-10-19 就因此踩过 FileNotFoundError，表现为"脚本一跑就崩，
         但用户自己开命令行跑又正常"。用绝对路径才稳。
+
+    ⚠️ 非 Windows 上直接返回裸名字 —— POSIX 的系统工具就在 PATH 里
+        （/usr/bin/curl），拼 System32 没有意义。这样调用方不用到处判断平台。
     """
+    if sys.platform != 'win32':
+        return name
     path = os.path.join(SYSTEM32, name)
     return path if os.path.exists(path) else name
 
@@ -48,7 +53,13 @@ def powershell_exe() -> str:
     ⚠️ 实测：在项目自己的 venv 里 `subprocess.run(['powershell', ...])`
         会 FileNotFoundError —— 进程 PATH 不含 PowerShell 目录。
         所以统一走这里。
+
+    ⚠️ 非 Windows 返回 'pwsh'（PowerShell Core）。注意：**本项目的
+        Windows 专属功能（计划任务、快捷方式、注册表）在 POSIX 上本来就用不了**，
+        这个函数只是保证"误调用时给出一个合理的名字"，不是真的支持。
     """
+    if sys.platform != 'win32':
+        return 'pwsh'
     cand = os.path.join(SYSTEM32, 'WindowsPowerShell', 'v1.0', 'powershell.exe')
     if os.path.exists(cand):
         return cand

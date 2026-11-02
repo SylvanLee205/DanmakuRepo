@@ -209,6 +209,9 @@ def setup_dirs():
 
 # ─────────────────────────────── 5. 可选集成 ───────────────────────────────
 def setup_desktop(assume_yes=False):
+    if not IS_WIN:
+        print('  （非 Windows：跳过桌面快捷方式）')
+        return
     script = os.path.join(PROJ, 'tools', 'install_desktop_links.py')
     if not os.path.exists(script):
         return
@@ -218,6 +221,9 @@ def setup_desktop(assume_yes=False):
 
 
 def setup_boot_task(assume_yes=False):
+    if not IS_WIN:
+        print('  （非 Windows：开机自启请用 systemd，见 docs/跨平台.md）')
+        return
     script = os.path.join(PROJ, 'tools', 'install_boot_task.py')
     if not os.path.exists(script):
         return
@@ -273,10 +279,17 @@ def main():
         tools = setup_tools(args.yes)
         if not tools.get('ffmpeg'):
             print(f'\n  {ERR} 没有 ffmpeg 就无法录制 —— 这步必须完成。')
-            print('        手动装法（任选）：')
-            print('          1) 下载 https://www.gyan.dev/ffmpeg/builds/ 解压后把 bin 目录加进 PATH')
-            print('          2) 把 ffmpeg.exe / ffprobe.exe 直接放进 tools\\ 目录')
-            print('          3) 重跑本向导并选择自动下载')
+            if IS_WIN:
+                print('        手动装法（任选）：')
+                print('          1) 下载 https://www.gyan.dev/ffmpeg/builds/ 解压后把 bin 目录加进 PATH')
+                print('          2) 把 ffmpeg.exe / ffprobe.exe 直接放进 tools\\ 目录')
+                print('          3) 重跑本向导并选择自动下载')
+            else:
+                print('        用包管理器装（任选）：')
+                print('          Debian/Ubuntu : sudo apt install ffmpeg fonts-noto-cjk')
+                print('          Fedora        : sudo dnf install ffmpeg')
+                print('          macOS         : brew install ffmpeg')
+                print('        ⚠️ 别忘了中文字体：没有 CJK 字体，弹幕渲染会整场失败。')
         if not tools.get('rclone'):
             print(f'  {WARN} 没有 rclone —— 录制备份不受影响，但网盘上传会跳过。')
 
@@ -293,14 +306,22 @@ def main():
     # ---- 总结 ----
     hr('完成')
     print('  下一步：')
-    print('    1) 双击 Start_DMR.bat      启动录制（有窗口，崩溃自动重启）')
-    print('    2) 双击 Add_Room.bat       粘贴直播间链接即可新增主播')
-    print('    3) 双击 Doctor.bat         任何时候出问题，先跑这个')
-    print()
-    print('  常用脚本：')
-    for f in sorted(os.listdir(PROJ)):
-        if f.lower().endswith('.bat') and not f.startswith('_'):
-            print(f'    {f}')
+    if IS_WIN:
+        print('    1) 双击 Start_DMR.bat      启动录制（有窗口，崩溃自动重启）')
+        print('    2) 双击 Add_Room.bat       粘贴直播间链接即可新增主播')
+        print('    3) 双击 Doctor.bat         任何时候出问题，先跑这个')
+        print()
+        print('  常用脚本：')
+        for f in sorted(os.listdir(PROJ)):
+            if f.lower().endswith('.bat') and not f.startswith('_'):
+                print(f'    {f}')
+    else:
+        print('    1) ./start.sh              启动录制')
+        print('    2) .venv/bin/python tools/add_room.py   新增主播')
+        print('    3) .venv/bin/python tools/doctor.py     出问题先跑这个')
+        print()
+        print('  ⚠️ 非 Windows 能跑录制/渲染/上传，但三层自启、桌面快捷方式、')
+        print('     注册表相关功能不可用。详见 docs/跨平台.md')
     print()
     return 0
 

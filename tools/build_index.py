@@ -248,6 +248,16 @@ def build(out_path=None, recordings_root=None):
     return out
 
 
+def _open_file(path):
+    """用系统默认程序打开文件（跨平台）。"""
+    if sys.platform == 'win32':
+        os.startfile(path)                       # noqa: S606
+    elif sys.platform == 'darwin':
+        subprocess.Popen(['open', path])
+    else:
+        subprocess.Popen(['xdg-open', path])
+
+
 def main():
     ap = argparse.ArgumentParser(description='生成录播索引页')
     ap.add_argument('--out', default=None, help='输出路径（默认 <项目>/index.html）')
@@ -262,7 +272,7 @@ def main():
         pass
     if args.open:
         try:
-            os.startfile(out)          # noqa: S606  (Windows only)
+            _open_file(out)
         except Exception as e:
             print(f'  打开失败: {e}')
     return 0

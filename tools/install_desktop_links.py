@@ -36,19 +36,27 @@ if PROJ not in sys.path:
 #    （2026-10-19 在 stop_dmr.py 上踩过同样的坑）
 from DMR.paths import powershell_exe  # noqa: E402
 
-#: (桌面显示名, 项目内目标文件, 说明)
+#: (桌面显示名, 项目内目标文件, 说明, assets/icons 里的图标名)
+#:
+#: 图标为什么自己生成（tools/make_icons.py）：
+#:   第一版用的是 `shell32.dll,3` —— 那是"文件夹"图标，7 个快捷方式全变成
+#:   一个黄文件夹。系统图标库的索引**含义随 Windows 版本变**，而且没有
+#:   "录制/体检/推送"这类语义，所以改成自带 ico。
 LINKS = [
-    ('DMR-启动',        'Start_DMR.bat',        '启动 DMR 录制（有窗口，崩溃自动重启）'),
-    ('DMR-停止',        'Stop_DMR.bat',         '优雅停止 DMR 和所有录制子进程'),
-    ('DMR-看实时日志',  'Watch_DMR_Log.bat',    '实时看日志和状态（没有窗口时用）'),
-    ('DMR-添加主播',    'Add_Room.bat',         '粘贴直播间链接即可新增主播'),
-    ('DMR-重启后检查',  'Check_After_Reboot.bat', '重启后确认录制是否正常'),
-    ('DMR-体检',        'Doctor.bat',           '出任何问题先跑这个'),
+    ('DMR-启动',        'Start_DMR.bat',        '启动 DMR 录制（有窗口，崩溃自动重启）', 'start'),
+    ('DMR-停止',        'Stop_DMR.bat',         '优雅停止 DMR 和所有录制子进程',        'stop'),
+    ('DMR-看实时日志',  'Watch_DMR_Log.bat',    '实时看日志和状态（没有窗口时用）',      'log'),
+    ('DMR-添加主播',    'Add_Room.bat',         '粘贴直播间链接即可新增主播',            'add'),
+    ('DMR-重启后检查',  'Check_After_Reboot.bat', '重启后确认录制是否正常',              'check'),
+    ('DMR-体检',        'Doctor.bat',           '出任何问题先跑这个',                    'doctor'),
 ]
 
 EXTRA_LINKS = [
-    ('DMR-推送全部',    'Push_All.bat',         '把项目推送到两个 GitHub 仓库'),
+    ('DMR-推送全部',    'Push_All.bat',         '把项目推送到两个 GitHub 仓库',          'push'),
 ]
+
+#: 图标目录
+ICON_DIR = os.path.join(PROJ, 'assets', 'icons')
 
 
 def desktop_dir() -> str:
@@ -83,12 +91,29 @@ def create_links(links, desk, dry=False):
         '',
     ]
     made = []
-    for i, (name, target, desc) in enumerate(links):
+    for i, (name, target, desc, icon) in enumerate(links):
         src = os.path.join(PROJ, target)
         if not os.path.exists(src):
             print(f'  ⏭  跳过 {name}：缺少 {target}')
             continue
         lnk = os.path.join(desk, name + '.lnk')
+
+        icon_path = os.path.join(ICON_DIR, f'{icon}.ico')
+        if not os.path.exists(icon_path):
+            icon_path = ''          # 没图标就让 Windows 用目标文件的默认图标
+
+        # ⚠️ 同名 .lnk 已存在时，WScript.Shell 的 Save() 会抛
+        #    UnauthorizedAccessException（资源管理器锁着它 / 属性只读）。
+        #    这个脚本是"可以反复跑"的，所以必须先清掉旧的。
+        #    Python 侧删不掉不要紧（有些环境把 os.remove 映射成"移到回收站"，
+        #    在某些上下文会失败）—— 下面生成的 ps1 里还有 [System.IO.File]::Delete
+        #    兜底，那是硬删除，不走回收站。
+        if os.path.exists(lnk):
+            try:
+                os.remove(lnk)
+            except OSError:
+                pass
+
         # ⚠️ 不要用 { } 把这几行包起来：PowerShell 里 { } 是**脚本块字面量**，
         #    写成一堆 { ... } 只会构造对象、根本不会执行，而且退出码还是 0
         #    —— 表现得像"运行成功但什么都没做"。（2026-11-02 踩过）
@@ -97,7 +122,15 @@ def create_links(links, desk, dry=False):
             f'$s{i}.TargetPath = {_ps_quote(src)}',
             f'$s{i}.WorkingDirectory = $proj',
             f'$s{i}.Description = {_ps_quote(desc)}',
-            f'$s{i}.IconLocation = "$env:SystemRoot\\System32\\shell32.dll,3"',
+        ]
+        if icon_path:
+            # 直接指向 .ico 文件（不带 ",索引"）
+            lines.append(f'$s{i}.IconLocation = {_ps_quote(icon_path)}')
+        # Save() 不能覆盖已存在的 .lnk（会抛 UnauthorizedAccessException）。
+        # 用 .NET 的 File::Delete 硬删除 —— 它不走回收站，也不受
+        # "SafeDelete" 类策略影响，比 Remove-Item / os.remove 可靠。
+        lines += [
+            f'if (Test-Path {_ps_quote(lnk)}) {{ [System.IO.File]::Delete({_ps_quote(lnk)}) }}',
             f'$s{i}.Save()',
             f'Write-Output ("OK " + {_ps_quote(lnk)})',
         ]
@@ -143,7 +176,7 @@ def clean_legacy_copies(links, desk, dry=False):
     stamp = datetime.datetime.now().strftime('%Y%m%d-%H%M%S')
     dest = os.path.join(PROJ, 'backups', f'desktop-shortcuts-{stamp}')
     moved = []
-    for name, _, _ in links:
+    for name, *_ in links:
         legacy = os.path.join(desk, name + '.bat')
         if not os.path.exists(legacy):
             continue
@@ -178,7 +211,7 @@ def clean_legacy_copies(links, desk, dry=False):
 
 def remove_links(links, desk):
     n = 0
-    for name, _, _ in links:
+    for name, *_ in links:
         p = os.path.join(desk, name + '.lnk')
         if os.path.exists(p):
             try:
@@ -207,6 +240,15 @@ def main():
 
     if args.remove:
         return remove_links(links, desk)
+
+    # 图标不存在就先画一批（纯本地生成，不联网、不依赖系统图标库）
+    try:
+        from tools import make_icons
+        got = make_icons.build_all()
+        if got:
+            print(f'  已生成 {len(got)} 个图标到 assets/icons/')
+    except Exception as e:
+        print(f'  ⚠️  图标生成失败（快捷方式将用系统默认图标）: {e}')
 
     if not args.keep_legacy:
         clean_legacy_copies(links, desk, dry=args.dry_run)

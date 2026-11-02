@@ -379,7 +379,22 @@ def install_tool(name: str, force=False) -> bool:
     """把工具下载到项目 tools/ 目录。返回是否成功。
 
     全部走"最新版"，不锁版本号 —— 上游发新版直接就能装上。
+
+    ⚠️ **只支持 Windows 自动下载**。Linux/macOS 上各自有包管理器和
+       久经考验的静态构建，硬塞一个自己下载的二进制反而容易踩坑
+       （glibc 版本、arm64/x86_64、动态库依赖…）。所以那边只给指引。
     """
+    if sys.platform != 'win32':
+        pkg = {'ffmpeg': 'ffmpeg', 'ffprobe': 'ffmpeg',
+               'rclone': 'rclone'}.get(name, name)
+        print(f'  非 Windows 平台，请用包管理器安装 {name}：')
+        print(f'    Debian/Ubuntu : sudo apt install {pkg}')
+        print(f'    Fedora        : sudo dnf install {pkg}')
+        print(f'    macOS         : brew install {pkg}')
+        if name == 'biliup':
+            print('    biliup        : 从 https://github.com/biliup/biliup/releases 下载对应平台包')
+        return False
+
     os.makedirs(_TOOLS_DIR, exist_ok=True)
 
     if not force:
