@@ -131,7 +131,11 @@ for mod in ('DMR.Cleaner', 'DMR.Render', 'DMR.Uploader',
         src = open(os.path.join(ROOT, mod.replace('.', os.sep) + '.py'),
                    encoding='utf-8').read() if os.path.exists(
             os.path.join(ROOT, mod.replace('.', os.sep) + '.py')) else ''
-        has_bn = 'basename(' in src
+        # ⚠️ 2026-11-02 修：原来用 `'basename(' in src` 判断，把
+        #    `os.path.basename(` 也算进去了 → liveevents 被误报"用了但没导入"。
+        #    改成只匹配**裸调用**（前面不是点、也不是标识符字符）。
+        import re as _re
+        has_bn = bool(_re.search(r'(?<![.\w])basename\s*\(', src))
         bn_ok = hasattr(m, 'basename')
         flag = '✅' if (not has_bn or bn_ok) else '❌ basename 用了但没导入！'
         print(f'  {flag} {mod}' + (f'  (用到 basename，可用={bn_ok})' if has_bn else ''))

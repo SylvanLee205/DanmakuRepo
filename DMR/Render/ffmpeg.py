@@ -113,20 +113,24 @@ class RawFFmpegRender(BaseRender):
             tail = '\n'.join(log.strip().split('\n')[-30:])
             return False, f'ffmpeg 退出码 {returncode}\n{tail}'
             
-    def render_one(self, cmds, **kwargs):
-        start_time = datetime.now()
-        status, info = self.call_ffmpeg(cmds, **kwargs)
-        if status:
-            output_info:VideoInfo = video.copy()
-            output_info.path = output
-            output_info.file_id = uuid()
-            output_info.size = os.path.getsize(output)
-            output_info.ctime = start_time
-            output_info.src_video_id = video.file_id
-            return status, output_info
-        else:
-            return status, info
-            
+    def render_one(self, video=None, danmaku=None, output=None, **kwargs):
+        """**不实现**。RawFFmpegRender 只是 ffmpeg 的薄封装。
+
+        它原本是上游模板方法的残留，函数体里引用了从未定义的 ``video`` /
+        ``output`` —— 真正被调用时必然 `NameError`，而且签名
+        ``(cmds, **kwargs)`` 与真实调用方式 ``render_one(video=..., output=...)``
+        也对不上（会先 `TypeError`）。
+
+        实测调用点只有 ``Render/__init__.py`` 一处，且那里只会拿到
+        ``DmRender`` / ``Transcode`` 的实例，两者各自实现了 ``render_one``。
+        所以这个方法**永远不会被调用**，但基类 ``BaseRender`` 是 ABC，
+        不实现就无法实例化 —— 因此保留并显式抛错，让"真被误调"时报得清楚。
+        """
+        raise NotImplementedError(
+            'RawFFmpegRender 只提供 call_ffmpeg()/stop()，不提供完整渲染流程；'
+            '需要渲染请用 DmRender 或 Transcode。'
+        )
+
     def stop(self):
         try:
             out, _ = self.render_proc.communicate(b'q', timeout=5)

@@ -285,10 +285,16 @@ class Cleaner():
         try:
             method = task['method']
             clean_args = task['args']
-            dst = clean_args.get('dest')
+            # ⚠️ 2026-11-02：dst 必须是**每个文件各算一次**的。
+            #    原来 dst 在循环外赋值、循环里被 replace_keywords 就地改写，
+            #    第二个文件就会拿「上一个文件已经替换过的路径」再去替换 ——
+            #    占位符已消失，于是所有文件都被移到**第一个文件**的目录下。
+            #    同一任务通常只有一组文件所以没暴露，但换 taskname 就会串味。
+            dst_tpl = clean_args.get('dest')
             cleaned_files = []
             for file in task['files']:
                 file:FileInfo
+                dst = dst_tpl
                 if not exists(file.path):
                     self.logger.warning(f'文件 {file.path} 不存在，跳过清理.')
                     continue

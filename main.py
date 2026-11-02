@@ -1,4 +1,4 @@
-from tools import check_pypi, check_update
+from tools import check_pypi
 check_pypi()
 
 import time
@@ -526,12 +526,18 @@ if __name__ == '__main__':
 
     if args.version:
         print(f'DanmakuRepo {VERSION}.')
-        print('https://github.com/SmallPeaches/DanmakuRender')
+        print('https://github.com/SylvanLee205/DanmakuRepo')
         exit(0)
-    
-    if not args.skip_update:
-        check_update(VERSION)
-    
+
+    # ⚠️ 2026-11-02 移除「检查上游更新」：
+    #    本项目已经大幅偏离上游 DanmakuRender（弹幕清洗、状态库、优雅停止、
+    #    磁盘保护、按需上传……），而上游的 release 包里**没有任何这些改动**。
+    #    原来每次启动都会打印「存在可用更新 → 可以运行 update.py」，
+    #    用户照做就会把整个项目的魔改冲掉，且不可恢复（update.py 甚至会把
+    #    旧文件塞进 .oldfile 再删掉）。
+    #    更新请走 git（README 有说明）。`--skip_update` 保留只为兼容旧脚本。
+    _ = args.skip_update
+
     config = Config(args.config)
 
     logger = logging.getLogger('DMR')

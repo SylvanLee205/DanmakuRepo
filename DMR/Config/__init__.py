@@ -207,8 +207,10 @@ class Config():
             if current_hash != self.file_hashes.get(self.global_config_path):
                 self.file_hashes[self.global_config_path] = current_hash
                 return 'global', None
-        except Exception:
-            pass
+        except Exception as e:
+            # global.yml 读不出来（被占用/权限/删了）。不能静默 ——
+            # 否则"改了配置没生效"完全无从解释。
+            self.logger.debug(f'检查 global 配置变更失败: {e}')
 
         # get replay configs
         current_files = set()
@@ -246,8 +248,14 @@ class Config():
                         self.logger.warning(f'任务 {t} 尚不在运行时配置中，尝试重新加载。')
                     if self.add_task_config(f):
                         updated_tasks.append(f)
-            except Exception:
-                pass
+            except Exception as e:
+                # ⚠️ 2026-11-02：这里原来是裸 `pass`。
+                #    后果：用户用"添加主播"写入配置后，如果解析/读取出错
+                #    （YAML 语法错、文件被占用、编码问题），**日志里一个字都没有**，
+                #    用户只看到"加上了但没出现在列表里"，完全无从排查。
+                #    下一轮（10 秒）会重试，所以这里用 warning 不会无限刷屏 ——
+                #    但至少让人看见"哪个文件出问题了"。
+                self.logger.warning(f'重载任务配置 {f} 失败（10 秒后重试）: {e}')
         
         if new_tasks or deleted_tasks or updated_tasks:
             self.replay_config_paths = list(current_files)

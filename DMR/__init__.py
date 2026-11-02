@@ -52,9 +52,13 @@ class DanmakuRepo():
         def _do():
             try:
                 from .notify import send
-                send('DanmakuRepo 运维提醒', lines)
-            except Exception:
-                pass
+                if not send('DanmakuRepo 运维提醒', lines):
+                    # 通知发不出去必须留痕 —— 2026-11-02 开播通知就是因为
+                    # 一路静默，死了两周都没人发现。
+                    logging.getLogger('DMR').warning(
+                        '运维通知发送失败（Server酱 未返回 code:0）')
+            except Exception as e:
+                logging.getLogger('DMR').warning(f'运维通知异常: %r', e)
         threading.Thread(target=_do, daemon=True).start()
 
     def _resolve_state_db_path(self) -> str:

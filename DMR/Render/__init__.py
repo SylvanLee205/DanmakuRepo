@@ -48,12 +48,34 @@ class Render():
                         self.failed_tasks[uuid] = task
                 self.logger.info(f'Loaded {len(self.failed_tasks)} failed render tasks.')
             except Exception as e:
+                # ⚠️ 2026-11-02：加载失败必须把坏文件挪走。
+                #    否则每次启动都报同一句错，而这份"待重试清单"实际上
+                #    已经废了 —— 那些渲染失败的分段永远不会再被重试，
+                #    但看起来只是"一个无关紧要的加载错误"。
                 self.logger.error(f'Failed to load failed tasks: {e}')
+                try:
+                    bad = f'{self.failed_tasks_file}.corrupt-{datetime.now():%Y%m%d-%H%M%S}'
+                    os.replace(self.failed_tasks_file, bad)
+                    self.logger.error(f'损坏的待重试清单已另存为 {bad}（内容需人工检查）')
+                except OSError:
+                    pass
 
     def save_failed_tasks(self):
+        """原子写入：先写临时文件再 replace，避免写一半崩溃留下半个 JSON。
+
+        为什么重要：这份清单是"渲染失败、下次启动要重试"的唯一记录。
+        直接 `open('w')` 写到一半断电，文件就是半截 JSON —— 下次启动
+        load 失败，所有待重试分段**永久丢失**（而且没有任何报错会提示你）。
+        """
         try:
-            with open(self.failed_tasks_file, 'w', encoding='utf-8') as f:
-                json.dump(self.failed_tasks, f, cls=DateTimeEncoder, ensure_ascii=False, indent=4)
+            os.makedirs(os.path.dirname(self.failed_tasks_file) or '.', exist_ok=True)
+            tmp = self.failed_tasks_file + '.tmp'
+            with open(tmp, 'w', encoding='utf-8') as f:
+                json.dump(self.failed_tasks, f, cls=DateTimeEncoder,
+                          ensure_ascii=False, indent=4)
+                f.flush()
+                os.fsync(f.fileno())
+            os.replace(tmp, self.failed_tasks_file)
         except Exception as e:
             self.logger.error(f'Failed to save failed tasks: {e}')
 

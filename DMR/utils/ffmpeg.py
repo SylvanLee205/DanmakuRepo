@@ -46,7 +46,21 @@ def concat_video_ffmpeg(video_list:list, output:str):
         output_info.file_id = uuid()
         output_info.size = os.path.getsize(output)
         output_info.ctime = start_time
-        output_info.duration = sum([video.duration for video in video_list])
+        # ⚠️ 2026-11-02：不能直接 sum([v.duration for v in video_list])。
+        #    VideoInfo.duration 的默认值是 **None**（dataclass.py:130），
+        #    只要有一段时长未知，sum 就会抛 TypeError —— 而此时 ffmpeg 已经
+        #    把文件合并完了，等于白做一遍（下次重试再炸一次）。
+        #    另外 -1 是 ffprobe 的失败哨兵，累加会把总时长算小。
+        #    这里只累加有效值；全都无效就保持 None（= 未知）。
+        _durs = []
+        for _v in video_list:
+            try:
+                _d = float(getattr(_v, 'duration', 0) or 0)
+            except (TypeError, ValueError):
+                _d = 0.0
+            if _d > 0:
+                _durs.append(_d)
+        output_info.duration = sum(_durs) if _durs else None
         return output_info
     else:
         return output

@@ -637,8 +637,9 @@ class StreamDownloadTask():
                     time.sleep(start_check_interval)
                     continue
                 _disk_warned = False
-            except Exception:
-                pass
+            except Exception as _e:
+                # maintenance 模块不可用不该拦住录制，但要留下痕迹
+                self.logger.debug(f'磁盘检查跳过: {_e}')
 
             try:
                 stop_waited = 0

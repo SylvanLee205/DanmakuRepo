@@ -3,7 +3,7 @@ import warnings
 import sys
 import subprocess
 
-__all__ = ('check_pypi', 'check_update')
+__all__ = ('check_pypi',)
 
 def compare_version(ver1, ver2):
     list1 = str(ver1).split(".")
@@ -67,20 +67,4 @@ def check_pypi():
             raise SystemExit(2)
         subprocess.Popen([sys.executable, '-m', 'pip', 'install', '-r', 'requirements.txt', '-i', 'https://pypi.tuna.tsinghua.edu.cn/simple']).wait()
         print('Python 包安装完成.')
-        return 
-
-def check_update(version):
-    try:
-        import requests
-        resp = requests.get('https://api.github.com/repos/SmallPeaches/DanmakuRender/releases/latest', timeout=5).json()
-        lastest_version = resp["tag_name"]
-        if compare_version(lastest_version, version) > 0:
-            print('存在可用更新：')
-            print(f"版本：{lastest_version}")
-            print(f"发行时间：{resp['published_at']}")
-            print(f"发行说明：{resp.get('name')}")
-            print(f"{resp.get('body','')}\n")
-            print("如果需要更新可以直接运行 update.py 或者前往 https://github.com/SmallPeaches/DanmakuRender 更新.")
-            print('')
-    except Exception as e:
-        print(f'检查更新失败, {e}')
+        return

@@ -1,4 +1,5 @@
 import logging
+import os
 import threading
 import queue
 import time
@@ -83,12 +84,31 @@ class Uploader():
                         self.failed_tasks[uuid] = task
                 self.logger.info(f'Loaded {len(self.failed_tasks)} failed upload tasks.')
             except Exception as e:
+                # ⚠️ 2026-11-02：把坏文件挪走，否则每次启动都报同一句错，
+                #    而这份"待重试上传"清单其实已经废了 —— 那些文件既不会被
+                #    重传、也不会被清理，只会一直占着磁盘。
                 self.logger.error(f'Failed to load failed tasks: {e}')
+                try:
+                    bad = f'{self.failed_tasks_file}.corrupt-{datetime.now():%Y%m%d-%H%M%S}'
+                    os.replace(self.failed_tasks_file, bad)
+                    self.logger.error(f'损坏的待重试上传清单已另存为 {bad}（需人工检查）')
+                except OSError:
+                    pass
 
     def save_failed_tasks(self):
+        """原子写入（同 Render 那份清单，理由一样）。
+
+        清单丢了 = 这些文件永远不会重试上传，也不会被清理 → 无限堆积。
+        """
         try:
-            with open(self.failed_tasks_file, 'w', encoding='utf-8') as f:
-                json.dump(self.failed_tasks, f, cls=DateTimeEncoder, ensure_ascii=False, indent=4)
+            os.makedirs(os.path.dirname(self.failed_tasks_file) or '.', exist_ok=True)
+            tmp = self.failed_tasks_file + '.tmp'
+            with open(tmp, 'w', encoding='utf-8') as f:
+                json.dump(self.failed_tasks, f, cls=DateTimeEncoder,
+                          ensure_ascii=False, indent=4)
+                f.flush()
+                os.fsync(f.fileno())
+            os.replace(tmp, self.failed_tasks_file)
         except Exception as e:
             self.logger.error(f'Failed to save failed tasks: {e}')
 

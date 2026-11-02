@@ -775,6 +775,17 @@ class LiveEvents(BaseEvents):
           若沿用"未知就跳过"，恢复出来的产物会永远传不上去。
         """
         duration = getattr(video, 'duration', None)
+        # ⚠️ 2026-11-02：先把 -1 / 0 归一化成"未知"。
+        #    `FFprobe.get_duration` 探测失败时返回 **-1**（见 DMR/utils/ffprobe.py），
+        #    而 -1 是 truthy —— 会走下面的"时长太短"分支直接拒传，
+        #    于是"时长未知改用文件大小兜底"对 mkv/flv **永远不生效**。
+        #    （对 mp4 结果碰巧一样，所以一直没暴露。）
+        try:
+            if duration is not None and float(duration) <= 0:
+                duration = None
+        except (TypeError, ValueError):
+            duration = None
+
         # 0 与 None 同等看待：对已封闭的录制文件来说"时长 0 秒"只意味着元信息
         # 没写上（或探测失败），不是真实时长。
         if duration:
