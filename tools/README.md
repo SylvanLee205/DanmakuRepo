@@ -130,7 +130,7 @@ CD2 挂载盘方案已于 2026-11-02 废弃（上传改走 rclone 直传，
 | `trace_missing_render.py` | 追踪"没有弹幕版"的分段 |
 | `diag_stuck_recording.py` | 录制卡住诊断 |
 | `prescan.release.py` | 发布前扫描（脱敏检查） |
-| `update_bat_dynamic_notify.py` | 批量更新 bat 里的通知逻辑 |
+| `make_handover_bundle.py` | **一键生成瘦身交接包**（含完整 git 历史 + 脱敏配置，约 7MB） |
 
 ## 十、手工验证脚本（`test_*.py`）
 

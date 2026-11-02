@@ -138,10 +138,13 @@ main.py
 2. **`hevc_qsv` 本身不稳定**（与 10-20 Intel Arc 蓝屏 `0x113` 可能同源）。
    DMR 有"qsv 失败降级 libx265"兜底，但每次都要先炸一次。**下一步：更新 Intel Arc 驱动**
    （本机 `32.0.101.9150`，比官网 WHQL 还新；可试 DDU 干净卸载后装官方版）。
-3. **Windows 更新改成不自动重启**（蓝屏根因链条 = 更新→重启→18 分钟后显卡驱动炸）。
-4. **Linux 移植**：用户暂缓。障碍全在启动层（bat/计划任务/COM），依赖层有 manylinux 轮子。
+3. **Server酱³ 的 key 必须重置**：旧 key 曾硬编码在 `notify.py` 里并进了 git 历史
+   （公开仓库可见）。代码已改成从 `.login_info/notify_key.txt` 读，但**历史里那份
+   仍有效** —— 去 Server酱³ 后台重置，把新 key 写进那个文件（第一行 key、第二行 uid）。
+4. **Windows 更新改成不自动重启**（蓝屏根因链条 = 更新→重启→18 分钟后显卡驱动炸）。
+5. **Linux 移植**：用户暂缓。障碍全在启动层（bat/计划任务/COM），依赖层有 manylinux 轮子。
    清单见 `docs/跨平台.md`。**不建议仅为"更稳"重装** —— 实测 45 天仅 1 次蓝屏，且是 GPU 驱动。
-5. `tools/resync_state.py` 未建（状态库把已归档产物标 `missing` 终态，若需重建索引可做）。
+6. `tools/resync_state.py` 未建（状态库把已归档产物标 `missing` 终态，若需重建索引可做）。
 
 ---
 
@@ -186,8 +189,33 @@ python tools\check_undefined_names.py        :: 未定义名字
 | CD2 (`clouddrive.exe`) | WebDAV 网盘通道 | **以 Windows 服务运行**。若它挂掉上传会失败（进 `failed_uploads.json`，不丢文件），修好后重试补传 |
 | biliup | B 站投稿 | 可选 |
 | stream-gears | B 站流下载 | 依赖 wheels，注意平台匹配 |
-| Server酱³ | 微信通知 | key 在 `configs/` 里，不入 git |
+| Server酱³ | 微信通知 | **key 不在代码里**（2026-11-03 起）：`.login_info/notify_key.txt`（第一行 key、第二行 uid）或环境变量 `DMR_SCT_KEY` / `configs/global.yml` 的 `notify.sct_key`。该目录已 gitignore |
 | 桌面快捷方式 8 个 | 启动/重启/停止/日志/加主播/重启后检查/体检/推送 | `tools\install_desktop_links.py` 幂等重建 |
+
+> ⚠️ **Server酱 key 曾硬编码在 `notify.py` 里并进了 git 历史**（公开仓库可见）。
+> 代码已改成读配置，但**旧 key 必须去 Server酱³ 后台重置**才作废。
+
+---
+
+## 8b. 想把项目"交给"别人 / 另一个 AI 时怎么做
+
+生产目录有 **14 GB**（绝大部分是录播），不能直接打包发。三种方式：
+
+| 方式 | 命令 | 说明 |
+|---|---|---|
+| **瘦身包（推荐）** | `python tools\make_handover_bundle.py` | 出 `F:\DanmakuRepo-交接-<时间戳>.zip`，约 **7 MB / 1550 文件**，含完整 git 历史（80 提交）、全部文档、源码、工具脚本、脱敏后的任务配置。自动自检"包内无明文 key" |
+| 直接给文件夹 | `python tools\make_handover_bundle.py --out-dir D:\handover` | 同上但解压成目录，本地给 AI 读更方便 |
+| 只给仓库 | clone `github.com/SylvanLee205/DanmakuRepo` | 只有代码，**不含 configs/**（用户配置不入库）、不含状态库 |
+
+**接手方的第一句话**（不管是哪个 AI）：
+
+> 接手 DanmakuRepo 项目。先读仓库根的 `HANDOVER.md` 和 `AGENTS.md`，
+> 再读 `docs/maintainer-log.md`。改代码前看完 HANDOVER.md 第 4 节的铁律
+> 和第 5 节的坑速查表。
+
+`AGENTS.md` 是给 AI 工具的入口约定（Codex / Cursor / Claude Code / Cline 等
+会自动读仓库根的 AGENTS.md），`HANDOVER.md` 是给人看的完整交接文档。
+
 
 ---
 

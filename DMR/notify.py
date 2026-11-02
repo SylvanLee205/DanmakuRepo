@@ -28,6 +28,17 @@
     调用方可以打出来（14:40 有一次失败，日志只写"未返回 code:0"，
     完全看不出是超时、额度用完还是 5xx）。
 
+⚠️ **凭据不再硬编码（2026-11-03 修）**：
+    原来 Server酱³ 的 key 直接写在下面的 URL 常量里，而这个文件在**公开仓库**
+    `SylvanLee205/DanmakuRepo` 里 —— 任何拿到仓库的人都能拿你的额度发通知。
+    现在按优先级读取：
+        1) 环境变量 ``DMR_SCT_KEY``（可选 ``DMR_SCT_UID``）
+        2) ``configs/global.yml`` 的 ``notify.sct_key`` / ``notify.sct_uid``
+        3) ``.login_info/notify_key.txt``（第一行 key，第二行可放 uid）
+    ⚠️ **旧 key 已经进 git 历史**，光改代码不够 —— 必须去 Server酱³ 后台
+    重置（换一个 key），历史里那个就作废了。重置后把新 key 写进
+    ``configs/global.yml``（不入库）或环境变量。
+
 用法：
     from DMR.notify import send, last_error
     if not send('标题', ['第一行', '第二行']):
@@ -39,13 +50,73 @@ import sys
 import tempfile
 import time
 
-#: 两个等价的 Server酱³ 端点，按顺序试。key 已内嵌在 URL 里。
-API_URLS = [
-    'https://17530.push.ft07.com/send/sctp17530thl3urer2dsbnw3rnqyxzep.send',
-    'https://sctapi.ftqq.com/sctp17530thl3urer2dsbnw3rnqyxzep.send',
-]
+
+def _load_credentials():
+    """取 (uid, key)。都取不到返回 (None, None)。
+
+    uid 只是数字（Server酱³ 账号 id），key 才是秘密。
+    """
+    uid = os.environ.get('DMR_SCT_UID', '').strip()
+    key = os.environ.get('DMR_SCT_KEY', '').strip()
+
+    if not key:
+        # 2) configs/global.yml
+        try:
+            from .paths import CONFIGS
+            import yaml
+            gpath = os.path.join(CONFIGS, 'global.yml')
+            if os.path.isfile(gpath):
+                with open(gpath, encoding='utf-8') as f:
+                    g = yaml.safe_load(f) or {}
+                n = (g.get('notify') or {})
+                key = str(n.get('sct_key') or '').strip()
+                uid = uid or str(n.get('sct_uid') or '').strip()
+        except Exception:
+            pass
+
+    if not key:
+        # 3) .login_info/notify_key.txt
+        try:
+            from .paths import ROOT
+            p = os.path.join(ROOT, '.login_info', 'notify_key.txt')
+            if os.path.isfile(p):
+                with open(p, encoding='utf-8') as f:
+                    lines = [x.strip() for x in f.read().splitlines() if x.strip()]
+                if lines:
+                    key = lines[0]
+                    if len(lines) > 1 and not uid:
+                        uid = lines[1]
+        except Exception:
+            pass
+
+    return (uid or None), (key or None)
+
+
+#: (uid, key) —— 从配置/环境变量取，不在代码里
+_SCT_UID, _SCT_KEY = _load_credentials()
+
+
+def _build_api_urls(uid, key):
+    """两个等价端点，按顺序试。
+
+        https://<uid>.push.ft07.com/send/<key>.send
+        https://sctapi.ftqq.com/<key>.send
+
+    单端点在"网络环境半坏"时通知全灭，用户最先注意到的就是"怎么又没通知了"。
+    """
+    if not key:
+        return []
+    urls = []
+    if uid:
+        urls.append(f'https://{uid}.push.ft07.com/send/{key}.send')
+    urls.append(f'https://sctapi.ftqq.com/{key}.send')
+    return urls
+
+
+#: 两个等价的 Server酱³ 端点，按顺序试。
+API_URLS = _build_api_urls(_SCT_UID, _SCT_KEY)
 #: 兼容旧名字（有代码按 API_URL 引用）
-API_URL = API_URLS[0]
+API_URL = API_URLS[0] if API_URLS else ''
 
 # Markdown 硬换行：两个空格 + 换行符
 # 为什么不能用 <br>：实测会原样显示成 "<br>" 文本
@@ -136,6 +207,11 @@ def send(title, lines, timeout=15):
     返回 True/False；失败原因在模块级 ``last_error`` 里。
     """
     global last_error
+    if not API_URLS:
+        last_error = ('未配置 Server酱³ key：设环境变量 DMR_SCT_KEY，'
+                      '或写 configs/global.yml 的 notify.sct_key')
+        return False
+
     try:
         content = lines if isinstance(lines, str) else _join(lines)
     except Exception as e:

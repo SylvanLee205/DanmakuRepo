@@ -266,9 +266,22 @@ def chk_tasks():
 
 
 def chk_notify():
-    """检查通知服务能不能连上（真的发一条太吵，只测 TCP 443）。"""
+    """检查通知服务能不能连上（真的发一条太吵，只测 TCP 443）。
+
+    主机名从 DMR.notify 实际用的端点里取（不再硬编码 uid），
+    没配 key 时只提示"未配置凭据"，不做网络检查。
+    """
     import socket
-    host = '17530.push.ft07.com'
+    try:
+        from DMR.notify import API_URLS
+    except Exception:
+        API_URLS = []
+    if not API_URLS:
+        add(WARN, '未配置通知凭据',
+            'Server酱³ key 未设置，开播通知发不出去',
+            '设环境变量 DMR_SCT_KEY，或写 configs/global.yml 的 notify.sct_key')
+        return
+    host = API_URLS[0].split('/')[2]
     try:
         with socket.create_connection((host, 443), timeout=8):
             add(OK, '通知服务连通', f'{host}:443 可达')
