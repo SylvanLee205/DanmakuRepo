@@ -453,3 +453,97 @@ ffmpeg -y -f concat -safe 0 -i list.txt -c copy -movflags +faststart out.mp4
 
 **`scale` 为什么必须加**：`format=yuv420p` 只转像素格式，不重算 stride；
 `scale=720:1280` 强制重新分配缓冲，stride 才正确。
+
+---
+
+## 2026-11-02（下午～晚间）· 可移植性 + 一键重启 + 目录新布局 + CD2 出殡 + 通知重写
+
+> 覆盖当天 14:00–19:30 的全部改动。上午的 glyphs / 优雅停止 / 孤儿分段见上一节。
+
+### 1. 一键重启 `Restart_DMR.bat` → `tools/restart_dmr.py`
+
+改完 `DMR/` 下的代码**必须重启才生效**（无热加载）。以前要手动 Stop+Start，
+现在双击桌面「DMR-重启」即可。流程：停守护 cmd → 优雅停 DMR
+（graceful_stop 标志，ffmpeg 写完当前段）→ **清残留 graceful_stop 标志**
+（关键！不清的话新实例启动即退出 + 守护重拉 = 崩溃循环）→ explorer 拉起
+Start_Render.bat → 轮询验证（5s×18）。参数：`--force` / `--timeout N` /
+`--stop-only` / `--dry-run` / `--verify`。
+
+**踩坑：`from tools import stop_dmr` 有副作用** —— `tools/__init__.py` 是
+`from .check_env import *`，import 它会跑环境检查。restart_dmr 用
+importlib 按文件路径加载 stop_dmr，复用其进程探测 / 优雅停函数。
+
+### 2. 通知链路两轮修复（`DMR/notify.py` 重写）
+
+**第一轮（并发竞态）**：多个任务同开时共用固定文件 `notify_title.txt`
+互相覆盖 → 每次发送独立临时目录。
+
+**第二轮（传输层，当晚实盘）**：这台机器跑着 TUN 模式代理，DNS 全解析成
+198.18.x.x Fake-IP。对 `push.ft07.com`（Server酱³ 真实推送端点）：
+
+- Windows 自带 curl（SChannel TLS）**握手失败**（上游 CDN 换了证书链）
+- Git Bash curl（OpenSSL）能通
+- 结论：**curl 在这台机器上不可信**，改用 `requests`（OpenSSL）+
+  **双端点自动回退**（`sctapi.ftqq.com` 通就用它，失败切 `push.ft07.com`），
+  失败原因记 `last_error` 并打 warning。这解释了此前"通知时好时坏"
+  —— 是代理出口的锅，不是代码的锅。
+
+### 3. 录制目录新布局（`tools/migrate_layout.py` 已执行迁移）
+
+```
+直播回放/
+  ├── 原视频/<主播>/    源视频 + .ass（34 个任务配置同步改写）
+  └── 弹幕版/<主播>/    渲染成品
+```
+
+- 路径计算单一出处：`DMR/paths.py` 的 `danmaku_dir_for()` /
+  `source_root()` / `DANMAKU_SUBDIR`。**老配置没迁也会正确归位**（有测试）。
+- 迁移同时改状态库 117 条历史路径（改前自动备份 `.db.bak-*`）。
+- Cleaner 的"弹幕版永不删"保护走**文件名**判据（`（弹幕版）`后缀），
+  与目录布局无关，零影响。上传按文件传、网盘目录用 `{TASKNAME}` 变量，
+  同样零影响。
+- 新增主播：`add_room.py` 模板已更新，自动落 `原视频/<名字>/`。
+
+### 4. CD2 挂载盘方案出殡（上传链路**没有**变）
+
+上传链路一直是：**DMR 的 rclone → CD2 应用（WebDAV，clouddrive.exe 以
+Windows 服务跑）→ 百度网盘**。`cd2:` 只是 rclone 里这个 WebDAV remote 的
+名字。废弃的是**旧方案**（CD2 挂盘符 + 直写盘符），随删 7 个脚本：
+`cd2_watchdog` / `cd2_queue_health` / `cd2_stability_report` /
+`clean_cd2_queue` / `compare_cd2_versions` / `test_watchdog` /
+`stop_uploads_cooldown`（判据：CD2 计划任务早已不存在 + 全仓 grep 无调用者）。
+上传冷却实际在 `.temp/failed_uploads.json` + Uploader 内部重试。
+
+**已知风险（不改，audit 兜底）**：WebDAV 有"假成功"前科 —— 百度限流时
+CD2 可能吞数据但 rclone 退出码 0 → DMR 误判成功。`DMR_云端上传审计`
+计划任务（`tools/audit_cloud.py`，在用）定期对账云端 vs 本地，专抓这个。
+
+### 5. 杂项修复与踩坑速查
+
+| 坑 | 教训 |
+|---|---|
+| 编辑器改 bat/cmd 会把 CRLF 悄悄换成 LF | 改完必须用 python 把 `\n` 统一回 `\r\n` 并验证（改 Startup 的 `DMR_AutoUp.cmd` 实踩） |
+| `autostart_guard.py` 用裸 powershell 列进程 | venv / 沙箱 PATH 没有 powershell → FileNotFoundError → 保守跳过 → **DMR 起不来**。已改 psutil。`autostart_launch.py` 本来就是 which+psutil 双兜底 |
+| `push_all.py` 输出"公开=nochange" | 不一定没推 —— 它先同步 prodsync worktree 再推，用 `git status -sb` 验证 |
+| 两处非原子写 | `maintenance._save_state`、webapi 配置保存（Web 改配置写一半 → 坏 yml → 热加载丢任务）。均改 temp + `os.replace` |
+| 维护 tick 失败只记 debug | 静默死必须能查，升级 warning |
+| `.temp/failed_renders.json` 陈旧失败记录 | 清空成 `{}` 而不是删文件（Render 启动会读它）；11 条旧路径记录备份在 `backups/failed_renders-20261102-purge.json` |
+| PowerShell 变量名不区分大小写 | `$new` 与 `$NEW` 同名，循环里互相覆盖产生畸形 XML。改用不同名字 |
+| `boot_task.xml` 的 `<URI>` 必须与 schtasks 任务名一致 | 改任务名三处同步：bat 常量、XML URI、文档 |
+| Startup 的 `DMR_AutoUp.cmd` 是手工产物 | `install_session_tasks.ps1` 只重建 L2/L3 计划任务，**L1 换机要手放** |
+
+### 6. 桌面快捷方式（8 个，自绘图标）
+
+启动 / 重启 / 停止 / 看实时日志 / 添加主播 / 重启后检查 / 体检
+（`--all` 再加推送全部）。`tools/install_desktop_links.py` 幂等重建
+（同名 .lnk 无法覆盖 → 先 `[System.IO.File]::Delete()` 硬删）。
+图标 `assets/icons/*.ico` 由 `tools/make_icons.py`（Pillow）生成 ——
+之前用 `shell32.dll,3`，显示成文件夹图标。
+
+### 7. 验证
+
+- 514 个单元测试全过（含 8 个新布局契约测试 `unit_tests/test_paths_layout.py`）
+- `check_imports.py` / `check_undefined_names.py` 全绿
+- 重启实测多次：60s 优雅超时内自退、5s 新实例就位、零孤儿分段
+- 通知实测发送成功（手机收到）
+- 端到端遗留：等下次真实开播，确认新录像落 `原视频/<主播>/`、成品落 `弹幕版/<主播>/`
