@@ -41,9 +41,9 @@ except Exception:
 PROD = _PROJECT_ROOT
 WT = _PROJECT_ROOT + '-full'
 
-# 需要同步的 .temp 文件（其余是历史日志/看门狗中间态，不进副本）
-TEMP_FILES = ['failed_renders.json', 'baidu_cooldown.json',
-              'cd2_watchdog_state.json']
+# 需要同步的 .temp 文件（2026-11-02 清掉 CD2 遗留后只剩失败清单）
+TEMP_FILES = ['failed_renders.json', 'failed_uploads.json',
+              'maintenance_state.json', 'restart_history.json']
 # 需要同步的 logs 文件
 LOG_FILES = ['pending_clean.json']
 

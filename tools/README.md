@@ -1,6 +1,6 @@
 # tools 目录索引
 
-98 个脚本。**按用途分组**，不按字母序 —— 找东西时按"我要干什么"翻。
+92 个脚本。**按用途分组**，不按字母序 —— 找东西时按"我要干什么"翻。
 
 约定：**凡是会改文件/删文件的，默认都是预览模式**，加 `--apply` / `--force`
 才真动手。不确定就先裸跑一次看它打算做什么。
@@ -67,7 +67,6 @@
 | `recover_ffmpeg_segments.py` | 从 ffmpeg 分段恢复 |
 | `restore_dm_videos_from_cloud.py` | 从云端恢复弹幕版 |
 | `retry_failed_uploads.py` | 重试失败的上传 |
-| `stop_uploads_cooldown.py` | 解除上传冷却 |
 | `rerender_failed.py` | 重跑失败清单里的渲染（`failed_renders.json`） |
 
 ## 六、渲染与编码器
@@ -85,12 +84,16 @@
 
 ## 七、云盘 / CloudDrive2
 
+CD2 挂载盘方案已于 2026-11-02 废弃（上传改走 rclone 直传，
+`tools/audit_cloud.py` 仍在用 `cd2:` 这个 rclone remote 名做云端对账）。
+以下脚本已删除，历史版本在 git 里：
+
+`cd2_watchdog.py` `cd2_queue_health.py` `cd2_stability_report.py`
+`clean_cd2_queue.py` `compare_cd2_versions.py` `test_watchdog.py`
+`stop_uploads_cooldown.py`
+
 | 脚本 | 干什么 |
 |---|---|
-| `cd2_watchdog.py` | CD2 挂载盘守护（掉线自动重挂） |
-| `cd2_queue_health.py` | CD2 上传队列健康度 |
-| `cd2_stability_report.py` | CD2 稳定性报告 |
-| `clean_cd2_queue.py` | 清 CD2 卡死的队列 |
 | `audit_cloud.py` | 云端 vs 本地对账（哪些没传上去） |
 
 ## 八、代码与配置审计
@@ -127,7 +130,6 @@
 | `trace_missing_render.py` | 追踪"没有弹幕版"的分段 |
 | `diag_stuck_recording.py` | 录制卡住诊断 |
 | `prescan.release.py` | 发布前扫描（脱敏检查） |
-| `compare_cd2_versions.py` | CD2 版本对比 |
 | `update_bat_dynamic_notify.py` | 批量更新 bat 里的通知逻辑 |
 
 ## 十、手工验证脚本（`test_*.py`）
@@ -139,7 +141,7 @@
 `test_dual_upload` `test_emoji_cmd` `test_emoji_name` `test_pending_clean`
 `test_rclone_upload` `test_skip_upload` `test_skip_upload_config`
 `test_skip_upload_flow` `test_startup` `test_task_error_converge`
-`test_truncation` `test_upload_decoupled` `test_upload_e2e` `test_watchdog`
+`test_truncation` `test_upload_decoupled` `test_upload_e2e`
 
 ---
 
@@ -161,3 +163,20 @@
 git log --diff-filter=D --name-only -- tools/ | findstr diag_
 git show <commit>:tools/diag_xxx.py > tools/diag_xxx.py
 ```
+
+## 2026-11-02 第二轮清理（CD2 方案整体废弃）
+
+上传已改走 rclone 直传，CD2 挂载盘不再使用（其计划任务已删除），
+`cd2:` 只作为 rclone remote 名保留在 `audit_cloud.py` 的对账里。随之删除：
+
+- **CD2 守护/诊断 6 个**：`cd2_watchdog.py`（守护）、`cd2_queue_health.py`、
+  `cd2_stability_report.py`、`clean_cd2_queue.py`、`compare_cd2_versions.py`、
+  `test_watchdog.py`
+- **10-06 百度限流事故的一次性脚本**：`stop_uploads_cooldown.py`
+  （上传冷却早已换成 `.temp/failed_uploads.json` + Uploader 内部重试）
+
+同时清掉的运行时残留：`.temp/baidu_cooldown.json`、
+`cd2_watchdog_state.json`、`cd2_watchdog_task_backup.xml`、
+`cd2_app_autostart_backup.txt`；`.temp/failed_renders.json` 里 11 条指向
+`replay/xxx` 旧路径的陈旧失败记录也清空了（源视频早已归档移走，
+备份在 `backups/failed_renders-20261102-purge.json`）。

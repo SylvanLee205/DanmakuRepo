@@ -192,8 +192,12 @@ class WebApi:
                         
                         save_path = os.path.join(config_dir, new_filename)
                         try:
-                            with open(save_path, 'w', encoding='utf-8') as f:
+                            # 原子写：写一半崩溃不至于毁掉一份能用的任务配置
+                            # （DMR 会热加载 configs/，坏文件会让任务消失）
+                            tmp = save_path + '.tmp'
+                            with open(tmp, 'w', encoding='utf-8') as f:
                                 f.write(content)
+                            os.replace(tmp, save_path)
                             flash(f'Config {new_filename} saved successfully.', 'success')
                             return redirect(url_for('config_list'))
                         except Exception as e:

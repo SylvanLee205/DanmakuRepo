@@ -356,7 +356,7 @@ ffprobe -v error -show_entries format=duration -of csv=p=0 "xxx.mp4"
 | 某主播渲染反复失败 | 弹幕字符 / 硬件编码器 / 源视频损坏 | 看日志里那条渲染错误后面的 ffmpeg 原始输出 |
 | 磁盘被占满 | 源视频没被清（跳过上传的分段曾有 bug） | `python tools/clean_skipped_backlog.py`（默认预览） |
 | `[正在录制]` 文件越积越多 | 进程被杀留下的孤儿 | `python tools/rename_orphans.py --apply`，下次启动自动接管 |
-| 上传一直失败 | CD2 / 网盘 / 网络 | 看 `logs/cd2_watchdog.log`；上传有 5 次重试 + 冷却 |
+| 上传一直失败 | 网盘 / 网络 | 看上传日志与 `.temp/failed_uploads.json`；上传有 5 次重试 + 冷却；云端对账用 `python tools/audit_cloud.py` |
 | 重启后没有 DMR 窗口 | 计划任务拉起的进程窗口必隐藏 | 正常。用 `DMR-看实时日志.bat` 看状态；要窗口就双击 `DMR-启动.bat` |
 | RDP 连不上（报 0x5） | 单账号单会话被占 | 关自动登录 + 注销 console 会话 |
 

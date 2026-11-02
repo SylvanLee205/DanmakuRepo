@@ -45,7 +45,6 @@ FILES_FOR_AST = [
     'DMR/Uploader/subprocess_uploader.py', 'DMR/Task/liveevents.py',
     'DMR/Downloader/stream_downloader.py', 'DMR/notify.py',
     'tools/gen_restart_notify.py', 'tools/audit_cloud.py',
-    'tools/cd2_watchdog.py', 'tools/cd2_queue_health.py',
 ]
 
 

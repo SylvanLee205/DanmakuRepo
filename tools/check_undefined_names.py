@@ -25,8 +25,6 @@ FILES = [
     'DMR/notify.py',
     'tools/gen_restart_notify.py',
     'tools/audit_cloud.py',
-    'tools/cd2_watchdog.py',
-    'tools/cd2_queue_health.py',
 ]
 
 # 常见的内置/标准库名字，出现这些不算问题

@@ -94,8 +94,11 @@ class Maintenance:
     def _save_state(self) -> None:
         try:
             os.makedirs(TEMP, exist_ok=True)
-            with open(self.state_path, 'w', encoding='utf-8') as f:
+            # 原子写：写一半崩溃不至于把"今天做过体检"的记录弄丢
+            tmp = self.state_path + '.tmp'
+            with open(tmp, 'w', encoding='utf-8') as f:
                 json.dump(self.state, f, ensure_ascii=False, indent=2)
+            os.replace(tmp, self.state_path)
         except Exception as e:
             self.logger.debug(f'维护状态保存失败: {e}')
 

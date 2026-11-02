@@ -413,7 +413,8 @@ class DanmakuRepo():
                 try:
                     self.maintenance.tick()
                 except Exception as e:
-                    self.logger.debug(f'维护 tick 失败: {e}')
+                    # warning 而非 debug：磁盘水位/日志轮转挂了必须能从日志里看出来
+                    self.logger.warning(f'维护 tick 失败: {e}')
 
             time.sleep(REFRESH_INTERVAL)
 
