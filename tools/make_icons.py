@@ -88,9 +88,21 @@ def _upload(d, s):
                         radius=0.035 * s, fill=WHITE)
 
 
+def _restart(d, s):
+    """重启：带箭头的圆弧（顺时针循环箭头）。"""
+    w = int(0.085 * s)
+    box = [0.27 * s, 0.27 * s, 0.73 * s, 0.73 * s]
+    # 从左下顺时针画到右上，留一个缺口给箭头
+    d.arc(box, start=45, end=320, fill=WHITE, width=w)
+    # 缺口处的箭头（指向顺时针方向）
+    d.polygon([(0.72 * s, 0.20 * s), (0.74 * s, 0.45 * s), (0.49 * s, 0.35 * s)],
+              fill=WHITE)
+
+
 ICONS = {
     'start':   ((0x22, 0xC5, 0x5E), _play),      # 绿
     'stop':    ((0xEF, 0x44, 0x44), _stop),      # 红
+    'restart': ((0x0E, 0xA5, 0xE9), _restart),   # 亮蓝
     'log':     ((0x3B, 0x82, 0xF6), _log),       # 蓝
     'add':     ((0x06, 0xB6, 0xD4), _add),       # 青
     'check':   ((0xF5, 0x9E, 0x0B), _check),     # 橙

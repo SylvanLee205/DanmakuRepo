@@ -45,6 +45,7 @@ from DMR.paths import powershell_exe  # noqa: E402
 LINKS = [
     ('DMR-启动',        'Start_DMR.bat',        '启动 DMR 录制（有窗口，崩溃自动重启）', 'start'),
     ('DMR-停止',        'Stop_DMR.bat',         '优雅停止 DMR 和所有录制子进程',        'stop'),
+    ('DMR-重启',        'Restart_DMR.bat',      '改完代码后优雅重启（先停守护再拉起）', 'restart'),
     ('DMR-看实时日志',  'Watch_DMR_Log.bat',    '实时看日志和状态（没有窗口时用）',      'log'),
     ('DMR-添加主播',    'Add_Room.bat',         '粘贴直播间链接即可新增主播',            'add'),
     ('DMR-重启后检查',  'Check_After_Reboot.bat', '重启后确认录制是否正常',              'check'),

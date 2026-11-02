@@ -100,6 +100,7 @@ ffmpeg 拉流录制 → ts 分段（默认每小时一段）
 ```
 Setup.bat                首次安装 / 环境修复（幂等，随时可重跑）
 Start_DMR.bat            启动（守护循环，崩溃自动重拉）
+Restart_DMR.bat          一键重启（优雅停止 + 重新拉起 + 验证）
 Doctor.bat               一键体检
 _env.bat                 所有 bat 共用：解析 Python 解释器 + 补全 PATH
 tools/                   30+ 运维工具，默认预览、加 --apply 才动手
@@ -266,7 +267,7 @@ Start_DMR.bat
 | **停用主播** | **两步**：① 配置挪进 `configs/temp/` ② `python tools/purge_task_state.py --apply` |
 | **重新启用** | 配置从 `configs/temp/` 挪回 `configs/`（热加载）。历史状态没了，进度从头记 |
 | **改全局配置** | 改 `configs/global.yml` → **重启 DMR** |
-| **重启** | `python tools/stop_dmr.py`（优雅停止）→ `Start_DMR.bat` |
+| **重启** | 双击 **`Restart_DMR.bat`**（= `python tools/restart_dmr.py`）：停守护 → 优雅停 DMR → 重新拉起 → 验证。别只关窗口，守护会 10 秒后重拉 |
 | **改完代码** | 跑测试 → **重启 DMR**（代码不热加载） |
 
 **桌面脚本**（生产机 `C:\Users\Administrator\Desktop\`）：
