@@ -684,3 +684,26 @@ SHU SDO温州店（11-03 21:47）、姜姜（11-03 22:45）是热加载进来的
 - `unit_tests`：**514 tests，OK（5 expected failure）**
 - `push_all.py` 预览：仅剩本次改动的 4 个文件，不再被垃圾文件堵
 - 生产进程未重启（`main.py` 改动需重启才生效 → 等下次一键重启）
+
+### 6. 顺带挖出：`push_all.py` 的"预览"会真删文件
+
+修上面第 2 条时跑了一次 `push_all.py`（**默认预览模式**），它打印
+`删除 tools/test_upload_decoupled.py`，然后那个文件**真的从公开 worktree
+里消失了** —— 预览只保证"不提交/不推送"，但 worktree 已经被改了。
+
+代码位置 `tools/push_all.py` 的 `sync_public()`：`git checkout master -- .`
+和 `git rm --cached` + `os.remove` 都写在 `if not apply: return` **之前**。
+私有仓库那边的 `sync_full()` 是对的（同步函数都包在 `if apply:` 里），
+只有公开仓库这条路漏了。
+
+影响：任何人"先预览看一眼"都会把公开 worktree 弄脏，被删的文件要靠
+`git checkout HEAD -- <path>` 找回。属于**预览即破坏**，违背工具契约。
+
+修法：
+- `git checkout master -- .` 与删除动作都包进 `if apply:`
+- 预览改用 `git diff --name-status HEAD master` 统计待同步项，
+  删除的打印成 `[预览] 将删除 xxx`，一个字节都不动
+
+> 这个 bug 和前面 `.DS_Store` 堵推送是**互相掩护**的关系：
+> 因为推送一直被垃圾文件挡住，`--apply` 从没跑到同步段，
+> 所以"预览会删文件"一直没暴露。
