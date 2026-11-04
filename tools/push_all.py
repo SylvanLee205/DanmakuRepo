@@ -126,8 +126,21 @@ def sync_public(apply):
     else:
         # 预览模式：worktree 没被碰过，status 必然是干净的，不能拿它判断。
         # 改成直接比树差异（HEAD 对 master），这才是 apply 时会被带进来的内容。
+        #
+        # 注意：HEAD..master 里会包含那些"main 独有、master 没有"的文件
+        # （configs/global.example.yml、tools/*release*.py 等）—— 它们在 apply
+        # 时会被 PUBLIC_EXTRAS 保护住**不删**，所以预览也必须过滤掉，
+        # 否则会误报成"待提交 10 项"（2026-11-04 实踩）。
         diff = git(WT_PUBLIC, 'diff', '--name-status', 'HEAD', 'master', check=False)
-        lines = [l for l in diff.splitlines() if l.strip()]
+        lines = []
+        for l in diff.splitlines():
+            if not l.strip():
+                continue
+            parts = l.split('\t')
+            path = parts[-1]
+            if path in PUBLIC_EXTRAS:
+                continue        # 白名单文件，apply 时会保留，不算待同步
+            lines.append(l)
         for p in to_delete:
             lines.append('D\t%s' % p)
         if not lines:
