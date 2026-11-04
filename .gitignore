@@ -9,6 +9,13 @@
 /__pycache__/
 *.pyc
 
+# 操作系统垃圾文件（从 Mac / Finder 浏览 SMB 共享必然生成，2026-11-04 实踩）
+# 不忽略它们，push_all 的 master_dirty 会把推送通道永久堵死。
+.DS_Store
+._*
+Thumbs.db
+desktop.ini
+
 # 用户个人配置（绝不入库）
 /configs/
 global.ymal

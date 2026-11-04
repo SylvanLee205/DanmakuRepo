@@ -602,3 +602,85 @@ Web 界面的"失败渲染"列表也永远显示这堆不存在的东西。
 同时删掉同样带 key 的一次性脚本 `tools/update_bat_dynamic_notify.py`，
 `doctor.py` 的通知自检改读实际端点。**旧 key 仍需去 Server酱³ 后台重置**
 （历史里那份要作废）。
+
+---
+
+## 2026-11-04 晚 · 全链路实测验证 + 推送通道故障修复
+
+### 1. 目录新布局：端到端验证通过（可结案）
+
+11-02 引入 `直播回放/原视频/` + `直播回放/弹幕版/` 双目录后，代码有单测兜底，
+但一直标注"**未经真实开播验证**"。11-04 晚拿到完整证据链：
+
+```
+21:04  原视频/SHU SDO温州店/…21点04分.ts 落盘 801MB，同目录 .ass 195KB
+22:04  分段收尾、[正在录制] 改名为正式名
+22:07  渲染完成 → 弹幕版/…21点04分（弹幕版）.mp4  969MB
+       （hevc_qsv，1 小时素材渲 3 分钟）
+22:15  rclone 上传完成 → 落入 24h 延迟清理队列
+```
+
+同时核对：同一主播两目录已成对（原视频 12 文件 ↔ 弹幕版 7 成品），
+上传按文件走（`uploader` 收的是成品路径）、Cleaner 按 `（弹幕版）` 文件名判据
+（永不删成品），两条链路都**不受目录拆分影响**。此条从待办划掉。
+
+### 2. `push_all.py` 推送通道被 `.DS_Store` 堵死
+
+现象：跑 `tools/push_all.py` 直接退出
+```
+master 工作区有未提交改动，先处理掉再推：
+?? .DS_Store
+?? DMR/.DS_Store
+```
+但 `git diff` 是**空的** —— 一度让人以为是误报。
+
+真因两层：
+1. `master_dirty()`（`tools/push_all.py:81`）判据是 `git status --porcelain`
+   有没有输出。`??`（未跟踪）也算输出，所以**未跟踪的垃圾文件同样会堵推送**；
+   而 `git diff` 只比已跟踪文件，看不到 `??`，这是误判的根源。
+2. 根因是 `.gitignore` 里**没有 `.DS_Store`**。从 Mac 用 Finder 浏览这块
+   SMB 共享，**必然**在 Windows 盘上生成 `.DS_Store`（实测 5 个：
+   仓库根 / `DMR/` / `backups/` / `直播回放/` / 甚至 `.git/`）。
+   等于每浏览一次目录，推送通道就更堵一次。
+
+修法：`.gitignore` 增加"操作系统垃圾文件"段 —— `.DS_Store`、`._*`、
+`Thumbs.db`、`desktop.ini`。改完 `git status` 里两个 `??` 立刻消失，
+push_all 恢复。
+
+> 注意 `.gitignore` 是 **UTF-8 带 BOM** 的文件，改它别用会破坏 BOM 的工具，
+> 用 python 读写 `utf-8-sig` 并保持 LF。
+
+### 3. `requirements.txt` 的"幽灵改动"
+
+同一时段还出现过 `M requirements.txt`，但内容一字未改。
+
+真因：本机 git 全局 `core.autocrlf=true`（PortableGit 自带配置），
+工作区 checkout 成 CRLF、索引里存 LF，而 `txt` 没有在 `.gitattributes`
+里钉 `eol`，于是来回抖。实测 `git ls-files --eol`：
+`i/lf w/crlf attr/(空)`。
+
+修法：`.gitattributes` 补 `*.txt / *.json / *.toml / *.ini → text eol=lf`。
+改完 `git status` 干净。
+
+### 4. 心跳日志的主播数是启动快照，会骗人
+
+`main.py` 心跳每 30 分钟写一行 `[心跳] 程序运行中，监听 N 个主播。`，
+这个 `N` 取自启动时算好的 `n_tasks`（`main.py:637`），**之后永不刷新**。
+
+实测：日志一直写"监听 33 个主播"，而 `configs/DMR-*.yml` 实际 35 个 ——
+SHU SDO温州店（11-03 21:47）、姜姜（11-03 22:45）是热加载进来的，
+日志里能查到 `检测到新任务配置文件: …，正在添加任务...`，
+但心跳那行数字不动。
+
+这个 bug 的危害不是"数字不准"，而是**用户会拿它当判据**：
+看到 33 就以为有 2 个主播没加载成功。
+
+修法：新增 `_live_task_count()`，每次现取 `dmr.engine.task_dict` 的长度
+（热加载时 `engine.add_task` / `del_task` 会实时增删这张表）；
+取不到时打 `logger.warning` 并退回启动快照，**不静默**（铁律 4）。
+
+### 5. 本轮验证
+
+- `unit_tests`：**514 tests，OK（5 expected failure）**
+- `push_all.py` 预览：仅剩本次改动的 4 个文件，不再被垃圾文件堵
+- 生产进程未重启（`main.py` 改动需重启才生效 → 等下次一键重启）

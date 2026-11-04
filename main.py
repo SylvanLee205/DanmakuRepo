@@ -656,14 +656,29 @@ if __name__ == '__main__':
     # ── 心跳：定期往日志写一行，证明程序还在跑 ──
     # 用 INFO 级别（控制台也会显示，但 30 分钟才一行，不构成噪音）。
     # 主要作用是让"日志文件还在增长"成为"程序活着"的证据。
+    #
+    # 主播数**每次现取**引擎的 task_dict，不能用上面那个启动快照 n_tasks：
+    # 热加载新增/删除主播时引擎会增删 task_dict 条目，而 n_tasks 是启动那一刻
+    # 拍的，之后永远不变 —— 2026-11-04 实踩：日志一直写"监听 33 个主播"，
+    # 实际配置 35 个（SHU / 姜姜 是 11-03 晚热加载进来的）。
+    # 心跳数字骗人比没有数字更糟：用户会拿它当"主播没加载成功"的判据。
+
+    def _live_task_count():
+        try:
+            return len(dmr.engine.task_dict)
+        except Exception as e:            # 引擎还没起来 / 结构变了
+            logger.warning(f'[心跳] 读实时任务数失败({type(e).__name__}: {e})，'
+                           f'退回启动快照 {n_tasks}')
+            return n_tasks
 
     def _heartbeat():
         while True:
             time.sleep(1800)          # 每 30 分钟
             try:
-                logger.info(f'[心跳] 程序运行中，监听 {n_tasks} 个主播。')
-            except Exception:
-                pass
+                logger.info(f'[心跳] 程序运行中，监听 {_live_task_count()} 个主播。')
+            except Exception as e:
+                # 禁止裸 except: pass —— 心跳死掉会让人误判"程序挂了"
+                logger.warning(f'[心跳] 写入失败: {type(e).__name__}: {e}')
 
     try:
         threading.Thread(target=_heartbeat, daemon=True,

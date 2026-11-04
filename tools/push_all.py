@@ -90,25 +90,50 @@ def sync_public(apply):
         print('  ! worktree 不存在，跳过')
         return None
 
-    git(WT_PUBLIC, 'checkout', 'master', '--', '.')
+    # 预览模式不碰 worktree：只看"会删什么、会推什么"，不改一个字节。
+    # 2026-11-04 实踩：这段 checkout 原本无条件执行，预览一次就把公开
+    # worktree 里的文件覆盖成 master 版本了（虽然可还原，但"预览"不该有副作用）。
+    if apply:
+        git(WT_PUBLIC, 'checkout', 'master', '--', '.')
 
     # `git checkout master -- .` 只更新/新增，不删除 master 里已不存在的文件。
     # 这里补上删除，但保留 PUBLIC_EXTRAS。
+    #
+    # ⚠️ 删除只在 apply=True 时执行。
+    # 2026-11-04 实踩：预览模式（默认）也会真的 `git rm` + `os.remove` 掉文件，
+    # 只是不提交 —— 等于"看一眼会发生什么"就把公开 worktree 弄脏了，
+    # 且删掉的文件要 `git checkout HEAD --` 才能找回。预览必须零副作用。
     master_files = set(git(PROD, 'ls-tree', '-r', '--name-only', 'master').splitlines())
     tracked = [p for p in git(WT_PUBLIC, 'ls-files').splitlines() if p]
     to_delete = [p for p in tracked
                  if p not in master_files and p not in PUBLIC_EXTRAS]
     for p in to_delete:
+        if not apply:
+            print('  [预览] 将删除 %s' % p)
+            continue
         fp = os.path.join(WT_PUBLIC, p)
         git(WT_PUBLIC, 'rm', '-q', '--cached', '--', p)
         if os.path.isfile(fp):
             os.remove(fp)
         print('  删除 %s' % p)
 
-    changed = git(WT_PUBLIC, 'status', '--porcelain')
-    if not changed:
-        print('  无变化')
-        return 'nochange'
+    if apply:
+        # 真正同步之后，用 worktree 的 status 判断需要提交什么
+        changed = git(WT_PUBLIC, 'status', '--porcelain')
+        if not changed:
+            print('  无变化')
+            return 'nochange'
+    else:
+        # 预览模式：worktree 没被碰过，status 必然是干净的，不能拿它判断。
+        # 改成直接比树差异（HEAD 对 master），这才是 apply 时会被带进来的内容。
+        diff = git(WT_PUBLIC, 'diff', '--name-status', 'HEAD', 'master', check=False)
+        lines = [l for l in diff.splitlines() if l.strip()]
+        for p in to_delete:
+            lines.append('D\t%s' % p)
+        if not lines:
+            print('  无变化')
+            return 'nochange'
+        changed = '\n'.join(lines)
 
     subject = git(PROD, 'log', '-1', '--format=%s', 'master')
     print('  待提交 %d 项（提交信息：%s）' % (len(changed.splitlines()), subject))

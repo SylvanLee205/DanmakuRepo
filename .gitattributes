@@ -15,6 +15,19 @@
 *.yml   text eol=lf
 *.md    text eol=lf
 
+# 纯文本配置钉成 LF。
+# 不加这条时，本机 core.autocrlf=true 会把 requirements.txt checkout 成 CRLF，
+# 而索引里是 LF → 文件内容一字未改却被判成"已修改"，
+# 进而让 push_all 的 master_dirty() 拒绝推送（2026-11-04 实踩）。
+# 这两个文件自身也钉 LF：本机 core.autocrlf=true，不钉就会被 checkout 成 CRLF
+.gitignore      text eol=lf
+.gitattributes  text eol=lf
+
+*.txt   text eol=lf
+*.json  text eol=lf
+*.toml  text eol=lf
+*.ini   text eol=lf
+
 # 二进制
 *.exe   binary
 *.dll   binary
