@@ -707,3 +707,69 @@ SHU SDO温州店（11-03 21:47）、姜姜（11-03 22:45）是热加载进来的
 > 这个 bug 和前面 `.DS_Store` 堵推送是**互相掩护**的关系：
 > 因为推送一直被垃圾文件挡住，`--apply` 从没跑到同步段，
 > 所以"预览会删文件"一直没暴露。
+
+---
+
+## 2026-11-04 23:00 · 发布 v6.1.0
+
+### 1. 为什么发这个版
+
+GitHub 上此前只有 `v5.1.0`（2026-10-15）一个发行版。`v6.0.0` 的 tag 虽然早就
+推上去了，但**从没建过对应的 GitHub Release** —— 等于"打了标签没人看得见"。
+而 v6.0.0 之后又积累了 21 个提交（含目录新布局、一键重启、交接文档、
+大量缺陷修复、226 文件变更），早就该发一版了。
+
+### 2. 一个必须纠正的历史错误：v6.0.0 的 tag 打错分支了
+
+`main` 和 `master` 是**两条独立历史**（无共同祖先）：
+
+| 分支 | 角色 | 内容 |
+|---|---|---|
+| `master` | 生产分支（本机 `F:/DanmakuRepo` 在这里） | 只有代码，**无** `configs/` 任何东西 |
+| `main` | 公开发布分支 | `master` 的树 + `PUBLIC_EXTRAS`（含 `configs/global.example.yml`） |
+
+- `v5.1.0` 打在 **`main`** → 下载源码包能拿到示例配置 ✅
+- `v6.0.0` 打在 **`master`** → 下载源码包**完全没有 configs 目录** ❌
+
+后者是个真实缺陷：别人下载 Source code 后根本不知道怎么配 `global.yml`，
+得先读文档自己造一个。tag 已推上去改不了（强推会破坏别人已 clone 的引用），
+所以**约定：从 v6.1.0 起发行版 tag 一律打 `main`**，并在 HANDOVER 里写死这条。
+`v6.0.0` 标记为"tag 位置不正确，已作废不用"。
+
+### 3. 发布动作
+
+```bash
+git tag -a v6.1.0 main -m "..."      # 注意是 main，不是 master
+git push origin v6.1.0
+gh release create v6.1.0 \
+  --title "v6.1.0 —— 无人值守稳定性大修 + 全链路可观测" \
+  --notes-file docs/RELEASE-v6.1.0.md
+```
+
+发行说明正文放在 `docs/RELEASE-v6.1.0.md`（进仓库，可追溯），
+而不是只填在 GitHub 的 notes 框里 —— 这样文档和代码版本绑定，
+以后改仓库也能查到当时发了什么。
+
+**发布前脱敏自检**（每次都做）：
+- 发行版树里**没有** `configs/DMR-*.yml` / `rclone.conf` / `notify_key` / `.login_info/`
+- `configs/global.example.yml` 里没有 `SCT*` / `FT*` 形态的 key
+- 实测：`git ls-tree -r --name-only v6.1.0` 共 290 个文件，关键文件齐全
+
+### 4. 顺带踩到的坑：`.workbuddy/` 又被推送通道挡住
+
+写完记忆文件后 `push_all.py` 报 `?? .workbuddy/`。原因是**记忆文件写错了位置**
+（写进 `F:/DanmakuRepo` 而不是 agent 的工作区），生产仓库凭空多了个目录。
+
+不是 `.gitignore` 的问题，是操作失误：立刻把记忆挪回工作区
+`C:/Users/Administrator/WorkBuddy/<会话>/.workbuddy/memory/`，生产仓库恢复干净。
+
+> 教训：**生产仓库的干净是硬约束**。任何"顺手写个笔记"的操作都不能落在
+> `F:/DanmakuRepo` 里 —— 那个目录只有代码，没有杂项。
+
+### 5. 验证
+
+- `gh release view v6.1.0`：`isDraft=false`、`isPrerelease=false`、已发布
+- 远端 `refs/tags/v6.1.0` = `0daea7df`
+- 发行版树 290 文件，`README.md` / `HANDOVER.md` / `AGENTS.md` / `Setup.bat` /
+  `configs/global.example.yml` / `docs/RELEASE-v6.1.0.md` 全部在位
+- 514 个单元测试仍全绿

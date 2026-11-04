@@ -17,9 +17,14 @@
 | 本机目录 | `F:\DanmakuRepo` |
 | 公开仓库（代码） | `github.com/SylvanLee205/DanmakuRepo` —— 默认分支 **main** |
 | 私有仓库（含配置+状态库） | `github.com/SylvanLee205/DanmakuRepo-Full` —— 分支 **main** |
+| **当前发行版** | **`v6.1.0`**（2026-11-04）—— 说明见 `docs/RELEASE-v6.1.0.md` |
 | Python | 3.11，项目内 venv：`.venv\Scripts\python.exe` |
 | 主程序入口 | `main.py`（`python main.py`） |
 | 外部依赖 | ffmpeg / ffprobe、rclone、biliup、stream-gears、CD2 应用（WebDAV 网盘通道）、Server酱³ |
+
+**发行版 tag 打在 `main`（不是 `master`）**：`main` 含 `configs/global.example.yml`
+等示例配置，别人下载 Source code 就能直接当模板用。`master` 是生产分支，
+不含任何示例配置。**v6.0.0 的 tag 当时打错了（打在 master），已作废不用。**
 
 **克隆要看仓库**：公开仓库**不含** `configs/`（用户配置被 .gitignore 排除）、
 不含 `.temp/` 和状态库。要能直接跑起来，克隆**私有仓库**（或公开仓库 + 自己填 `configs/`）。
