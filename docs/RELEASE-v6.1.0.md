@@ -171,5 +171,10 @@
 ## 完整历史
 
 每个功能为什么这么做、踩过什么坑、怎么验证的，都在
-[`docs/maintainer-log.md`](maintainer-log.md)。建议接手前读一遍，
-能省掉大量重复踩坑。
+[`docs/maintainer-log.md`](https://github.com/SylvanLee205/DanmakuRepo/blob/main/docs/maintainer-log.md)。
+建议接手前读一遍，能省掉大量重复踩坑。
+
+> 注：这个文件会被当成 GitHub Release 的正文发布，而 Release 页面解析**相对链接**
+> 是相对**仓库根**、不是相对 `docs/`。所以这里的链接必须写成完整 URL，
+> 否则在 Release 页面上会跳到不存在的路径（2026-11-04 实踩）。
+
