@@ -64,6 +64,29 @@ def _read_clipboard_ctypes(retries: int = 5):
 
     ``(True, '')`` = 剪贴板确实没有文本（正常情况，不该再折腾）；
     ``(False, '')`` = 根本没拿到剪贴板访问权（句柄失效/被占用），该走兜底。
+
+    ★ 2026-11-06：**必须显式声明 GetClipboardData 的 restype 为 c_void_p**。
+
+    这是本函数崩溃（退出码 -1073741819 = 0xC0000005 访问冲突）的真正根因，
+    而不是 10-23 当时以为的"剪贴板被占用/句柄失效"。机制：
+
+      ctypes 调用 Win32 API 时，没声明 ``restype`` 就一律按 ``c_int`` 处理。
+      在 64 位 Python 下 ``c_int`` 只有 32 位，而 ``HANDLE``/``HGLOBAL``
+      是 64 位指针 —— **高位被静默截断**。
+
+      实测（本机 64 位 Python 3.11）：
+          完整句柄 0x24b64eccd10
+          截断后   0x64eccd10        ← 只剩低 32 位
+      把截断值传给 ``GlobalLock`` → 访问冲突 → 进程直接段错误，
+      **不打印任何 traceback**（崩溃发生在 C 层，Python 没机会捕获）。
+
+    所以会出现"双击后只弹一句请按任意键继续、什么输出都没有"的现象 ——
+    和剪贴板占用无关，纯属指针位宽问题。同样的坑也适用于
+    GlobalSize / GlobalUnlock 等所有吃句柄的 API。
+
+    另外：``c_char_p`` / ``c_wchar_p`` 作 restype 时 ctypes 会尝试把返回值
+    **转换为 Python 字符串**，遇到无效指针同样会崩。稳妥做法是用
+    ``c_void_p`` 拿原始句柄，再用 ``ctypes.wstring_at`` 手动读内存。
     """
     try:
         import ctypes
@@ -71,6 +94,18 @@ def _read_clipboard_ctypes(retries: int = 5):
         CF_UNICODETEXT = 13
         user32 = ctypes.windll.user32
         kernel32 = ctypes.windll.kernel32
+
+        # ── 关键：所有返回句柄的 API 都要显式声明成 c_void_p ──
+        # 不声明 = c_int = 32 位 = 高位截断 = 段错误。
+        user32.GetClipboardData.restype = ctypes.c_void_p
+        user32.GetClipboardData.argtypes = [ctypes.c_uint]
+        kernel32.GlobalLock.restype = ctypes.c_void_p
+        kernel32.GlobalLock.argtypes = [ctypes.c_void_p]
+        kernel32.GlobalUnlock.restype = ctypes.c_int
+        kernel32.GlobalUnlock.argtypes = [ctypes.c_void_p]
+        kernel32.GlobalSize.restype = ctypes.c_size_t
+        kernel32.GlobalSize.argtypes = [ctypes.c_void_p]
+
         # OpenClipboard 会被"正握着剪贴板的进程"拒绝（复制图片、某些输入法、
         # 远程桌面剪贴板同步时很常见），重试几次再放弃。
         opened = False
@@ -88,13 +123,16 @@ def _read_clipboard_ctypes(retries: int = 5):
             handle = user32.GetClipboardData(CF_UNICODETEXT)
             if not handle:
                 return (True, '')
-            kernel32.GlobalLock.restype = ctypes.c_wchar_p
-            kernel32.GlobalLock.argtypes = [ctypes.c_void_p]
-            text = kernel32.GlobalLock(handle)
-            if not text:
+            ptr = kernel32.GlobalLock(handle)
+            if not ptr:
                 return (True, '')
-            kernel32.GlobalUnlock(handle)
-            return (True, text)
+            try:
+                # 用 wstring_at 手动读，不用 c_wchar_p 作 restype：
+                # 后者会让 ctypes 自己去解引用，指针一旦可疑就直接崩。
+                text = ctypes.wstring_at(ptr)
+            finally:
+                kernel32.GlobalUnlock(handle)
+            return (True, text or '')
         finally:
             user32.CloseClipboard()
     except Exception:
@@ -123,10 +161,19 @@ def _read_clipboard_powershell() -> str:
 def read_clipboard() -> str:
     """读剪贴板文本；读不到返回空串（不抛异常）。
 
-    2026-10-23 加固：实测极少数情况下 ctypes 直接读剪贴板会让进程**段错误**，
-    控制台不打印任何东西就消失，用户看到的就是"双击后只弹一句请按任意键继续"。
-    根因是剪贴板被别的进程占用/句柄失效。现在：
-      1) OpenClipboard 失败会重试（占用是常见情况）
+    **2026-11-06 纠正归因**（此处以前写的是"剪贴板被占用/句柄失效"，那是错的）：
+
+    真正的崩溃原因是 ``GetClipboardData`` 没声明 ``restype``，ctypes 默认按
+    ``c_int``（32 位）处理返回值，64 位句柄的高 32 位被静默截断，再把残指针
+    传给 ``GlobalLock`` → 访问冲突 ``0xC0000005`` → 进程段错误，
+    **C 层崩溃，Python 不会有 traceback**。详见 `_read_clipboard_ctypes()`。
+
+    所以 10-23 那次"加固"（重试 OpenClipboard、先查格式）并没有修掉根因，
+    只是降低了触发概率 —— 于是 11-06 又崩了一次，症状完全一样。
+    现在根因已修（显式 c_void_p），这几层防御作为额外保险保留。
+
+    分层兜底策略：
+      1) OpenClipboard 失败会重试（剪贴板被占用确实是常见情况，值得重试）
       2) 先确认 CF_UNICODETEXT 可用再取句柄
       3) 只有"没拿到剪贴板访问权"才退回 PowerShell；剪贴板确实是空的不兜底
          （免得每次空剪贴板都白等一秒，还顺带吃掉用户的输入）

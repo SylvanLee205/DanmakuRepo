@@ -773,3 +773,119 @@ gh release create v6.1.0 \
 - 发行版树 290 文件，`README.md` / `HANDOVER.md` / `AGENTS.md` / `Setup.bat` /
   `configs/global.example.yml` / `docs/RELEASE-v6.1.0.md` 全部在位
 - 514 个单元测试仍全绿
+
+---
+
+## 2026-11-06 晚 · 「添加主播」崩溃的真正根因（10-23 归因错了）
+
+### 现象
+
+双击「DMR-添加主播」后：
+
+```
+[X] add_room.py exited with code -1073741819.
+If nothing was printed above, the script crashed before any output.
+Just try again - or paste the link manually when it asks.
+Press any key to continue . . .
+```
+
+`-1073741819` = `0xC0000005` = **ACCESS_VIOLATION（访问冲突）**。
+关键特征：**一行输出都没有**。如果是 Python 异常，traceback 会打出来；
+没有 traceback 说明崩溃发生在 **C 层**，Python 连捕获的机会都没有。
+
+### 10-23 当时的归因（错的）
+
+`Add_Room.bat` 和 `read_clipboard()` 的注释里写着：
+
+> 实测极少数情况下 ctypes 直接读剪贴板会让进程**段错误**……
+> 根因是剪贴板被别的进程占用/句柄失效。
+
+于是做了三层加固：OpenClipboard 重试、先查 `IsClipboardFormatAvailable`、
+拿不到访问权才退回外部命令兜底。
+
+**方向错了。** 所以 11-06 又崩了一次，症状一模一样 —— 这说明加固没碰到根因，
+只是降低了触发概率。
+
+### 真正的根因：ctypes 默认 restype 是 32 位
+
+`tools/add_room.py` 原来这么写：
+
+```python
+handle = user32.GetClipboardData(CF_UNICODETEXT)   # ← 没声明 restype
+kernel32.GlobalLock.restype = ctypes.c_wchar_p
+kernel32.GlobalLock.argtypes = [ctypes.c_void_p]
+text = kernel32.GlobalLock(handle)
+```
+
+ctypes 调用 Win32 API 时，**没声明 `restype` 就一律按 `c_int` 处理**。
+在 64 位 Python 下 `c_int` 只有 32 位，而 `HANDLE`/`HGLOBAL` 是 64 位指针
+—— **高 32 位被静默截断**。
+
+本机实测（64 位 Python 3.11）：
+
+```
+完整句柄 0x24b64eccd10
+截断后   0x64eccd10        ← 只剩低 32 位
+默认返回值 -1341914016  =  0xb0040460
+正确返回值 2184796439648 = 0x1fcb0040460
+```
+
+把截断值传给 `GlobalLock`，直接 `Segmentation fault`：
+
+```
+截断句柄: 0x64eccd10
+完整句柄: 0x24b64eccd10
+rc=139   Segmentation fault
+```
+
+**为什么是"偶发"的**：堆句柄的高 32 位有时候恰好是 0（此时截断无损，正常运行），
+有时候非零（截断后指向野地址 → 崩）。所以这 bug 看起来"时好时坏"，
+而且越跑越容易碰上（进程堆地址随机化 + 堆增长都会让高位变成非零）。
+这也是为什么"重试一次就好了" —— 下一次进程拿到的高位可能是 0。
+
+还有一个次要陷阱：**不要用 `c_char_p` / `c_wchar_p` 作 restype**。
+它们会让 ctypes **自己解引用**返回值，指针一旦无效同样崩在 C 层。
+
+### 修法
+
+```python
+# 所有返回/接收句柄的 API 都显式声明成 c_void_p
+user32.GetClipboardData.restype = ctypes.c_void_p
+user32.GetClipboardData.argtypes = [ctypes.c_uint]
+kernel32.GlobalLock.restype = ctypes.c_void_p
+kernel32.GlobalLock.argtypes = [ctypes.c_void_p]
+kernel32.GlobalUnlock.restype = ctypes.c_int
+kernel32.GlobalUnlock.argtypes = [ctypes.c_void_p]
+
+handle = user32.GetClipboardData(CF_UNICODETEXT)
+ptr = kernel32.GlobalLock(handle)      # 原始指针，不解引用
+try:
+    text = ctypes.wstring_at(ptr)      # 手动读，自己控制
+finally:
+    kernel32.GlobalUnlock(handle)
+```
+
+原来的三层防御（重试 / 查格式 / 外部命令兜底）全部保留 —— 它们本身是对的，
+只是不足以修根因。
+
+### 验证
+
+- 实测读剪贴板：修复前必崩，修复后正确返回 `'https://live.douyin.com/865102911165\r\n'`
+- **连跑 20 次，0 失败**（原来"偶发"崩溃，必须靠重复验证）
+- 完整 `add_room.py --dry-run`：正常识别、正确跳过已存在房间、退出码 0
+- 新增 `unit_tests/test_add_room.py`（15 个测试）：
+  - 5 个是**静态断言**，检查句柄 API 是否声明了指针宽度类型
+    （不依赖真实剪贴板，CI 也能跑）
+  - 6 个测链接解析（纯房间号 / 完整 URL / 抖音分享脏文本 / 多链接 / 去重 / 空）
+  - 4 个测配置模板（四开关 / dltype / 新布局输出目录 / Windows 非法字符）
+- **反向验证过测试有效**：把代码临时改回旧写法，3 个测试立刻失败
+- 全量：**529 tests OK**（514 + 15）
+
+### 教训（写进 HANDOVER 坑速查）
+
+1. **看到 `0xC0000005` + 没有任何 traceback，先怀疑指针位宽**，不要怀疑业务逻辑。
+2. `ctypes` 不写 `restype` = `c_int` = 32 位。64 位下凡是句柄/指针都要显式声明。
+   项目里的正确范式：`DMR/utils/instance_lock.py` 用 `wintypes.HANDLE`。
+3. **归因要打到能复现的层面**。10-23 那次只观察到"段错误"就归因为"剪贴板被占用"，
+   结果加固了一圈防御，根因原封不动，两个月后又崩。判断"根因是否找对"的标准
+   应该是：**能不能稳定复现、修完能不能验证不再复现**。

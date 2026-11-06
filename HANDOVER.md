@@ -146,6 +146,8 @@ main.py
 | `.DS_Store` 越清越多、清不完 | 从 Mac / Finder 浏览这个 SMB 共享**必然**在 Windows 盘生成。只能靠 `.gitignore` 挡住（已加 `.DS_Store` / `._*` / `Thumbs.db` / `desktop.ini`），不要指望手动删干净 |
 | 心跳日志里的主播数跟 `configs/` 实际数量对不上 | `main.py` 心跳曾用启动时快照 `n_tasks`，热加载增删主播后不刷新（实测写 33、实际 35）。已改成每次现取 `dmr.engine.task_dict` |
 | `requirements.txt` 显示"内容相同却算改动" | 这台机器 `core.autocrlf=true`（PortableGit 全局配置），工作区文件被 checkout 成 CRLF、索引里是 LF。`txt` 没在 `.gitattributes` 里钉 `eol`，所以来回抖。真要钉就加 `*.txt text eol=lf`，但**注意**别把需要 CRLF 的文件扫进去 |
+| **双击「添加主播」报退出码 `-1073741819`，控制台一行输出都没有** | 这个码 = `0xC0000005` 访问冲突（段错误）。真因是 `tools/add_room.py` 读剪贴板时 **`GetClipboardData` 没声明 `restype`** → ctypes 默认按 `c_int`（32 位）处理 → 64 位 HANDLE 高位被**静默截断** → 残指针传给 `GlobalLock` → 崩。**不是**当初以为的"剪贴板被占用"（10-23 加固错了方向，所以 11-06 又崩一次）。修法：所有返回/接收句柄的 API 显式声明 `c_void_p`，字符串用 `ctypes.wstring_at` 手动读，别用 `c_wchar_p` 作 restype。已锁进 `unit_tests/test_add_room.py` |
+| **任何 `ctypes` 调 Win32 API 崩得莫名其妙（无 traceback）** | 先怀疑**指针位宽**：不写 `restype` 就是 `c_int`=32 位，64 位下一切指针/句柄都会被截断。对照正确范式：`DMR/utils/instance_lock.py` 用 `wintypes.HANDLE`。这类崩溃发生在 C 层，Python 抓不到，所以**没有任何日志** —— 看到"双击后什么都没发生"就往这想 |
 | PowerShell 脚本块 `{ }` 不执行 | 包在 `{}` 里只构造不执行，要平铺语句 |
 
 ---
