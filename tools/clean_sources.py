@@ -83,31 +83,162 @@ def cloud_files(task):
         return None
 
 
+def _scan_layouts():
+    """按当前磁盘布局枚举 (原视频目录, 弹幕版目录) 配对。
+
+    ⚠️⚠️ 2026-11-09 修：原来只认老布局（``直播回放/<主播>/`` +
+    ``直播回放/<主播>（弹幕版）/``）。11-02 改成新布局后，``直播回放/`` 下
+    只剩 ``原视频`` 和 ``弹幕版`` 两个目录，老逻辑把这两个当"主播名"去找
+    ``原视频（弹幕版）``、``弹幕版（弹幕版）``，永远找不到 → 整个工具
+    静默变成"没有可清理的文件"。实盘后果：4 个已上传分段的源视频
+    （2.2GB）在磁盘上躺了一周没人清。
+
+    新布局：``直播回放/原视频/<主播>/`` + ``直播回放/弹幕版/<主播>/``
+    老布局：``直播回放/<主播>/``      + ``直播回放/<主播>（弹幕版）/``
+    两种都返回，互不冲突（新布局的两级目录名不会撞上老布局的单级模式）。
+    """
+    pairs = []
+    if not os.path.isdir(REPLAY):
+        return pairs
+
+    # ── 新布局 ──
+    src_root = os.path.join(REPLAY, '原视频')
+    out_root = os.path.join(REPLAY, '弹幕版')
+    if os.path.isdir(src_root):
+        for task in sorted(os.listdir(src_root)):
+            src_dir = os.path.join(src_root, task)
+            if not os.path.isdir(src_dir):
+                continue
+            out_dir = os.path.join(out_root, task)
+            pairs.append((src_dir, out_dir if os.path.isdir(out_dir) else None,
+                          task))
+
+    # ── 老布局（兼容残留，避免迁移未完成时漏清）──
+    for task in sorted(os.listdir(REPLAY)):
+        sub = os.path.join(REPLAY, task)
+        if not os.path.isdir(sub):
+            continue
+        if task in ('原视频', '弹幕版'):
+            continue                      # 新布局容器，不是主播目录
+        if task.endswith(RENDERED_DIR_SUFFIX):
+            continue                      # 弹幕版目录是产物，不动
+        out_dir = os.path.join(REPLAY, task + RENDERED_DIR_SUFFIX)
+        pairs.append((sub, out_dir if os.path.isdir(out_dir) else None, task))
+    return pairs
+
+
+def _exists_rendered(stem, rendered_files):
+    """判断某个源分段是否有对应成品，容忍 ``(n)`` 重名后缀。
+
+    为什么不能只做一次精确匹配：
+    同名的分段重录时，DMR 会把产物命名成 ``xxx(2)（弹幕版）.mp4``。原实现
+    拿 ``stem + （弹幕版）.mp4`` 精确比对，于是 ``掉了颗兔牙-...00点20分.ts``
+    永远对不上 ``掉了颗兔牙-...00点20分(2)（弹幕版）.mp4``，源文件永久滞留
+    （实测 755MB 躺了一周）。
+    """
+    for suffix in ('', ) + tuple(f'({i})' for i in range(1, 10)):
+        if f'{stem}{suffix}{RENDERED_DIR_SUFFIX}.mp4' in rendered_files:
+            return True
+    # 兜底：成品名以「源名 + 可选(n)」开头即算命中，防止 DMR 用了别的后缀
+    for name in rendered_files:
+        if not name.endswith(RENDERED_DIR_SUFFIX + '.mp4'):
+            continue
+        base = name[:-len(RENDERED_DIR_SUFFIX + '.mp4')]
+        if base == stem:
+            return True
+        if base.startswith(stem) and re.fullmatch(r'\(\d+\)', base[len(stem):]):
+            return True
+    return False
+
+
+def _exists_in_cloud(stem, cloud_set):
+    """判断源分段的内容是否真的在云端（严格同名，不容忍前缀巧合）。
+
+    ⚠️⚠️ 2026-11-09 修：原实现是
+
+        cloud_hit = any(n.startswith(stem[:len(stem) - 6]) for n in cloud_set)
+
+    截掉末尾 6 个字符后做前缀比对。这个 6 是照 ``14点19分`` 的长度猜的，
+    结果把时间戳削成了 ``...11月07日`` —— 只要那天**任意**一场录制上了云，
+    任何分段都会被判成"云端已有"。实盘险情：
+        vvu-...11月07日14点19分.ts   被匹配到 ...11月07日15点19分（弹幕版）
+        君君.-...11月06日18点52分.ts 被匹配到 ...11月06日18点03分（弹幕版）
+    而这两段恰恰是**渲染失败、从未上传**的（产物时长异常被删）。
+    若不修，--apply 会把它们删掉，那两段直播就永久没有弹幕版了。
+
+    现在改为严格比对：云端名必须是 ``<stem>（弹幕版）.mp4`` 或带 ``(n)``
+    重名变体。emoji 清洗可能改动文件名，所以额外允许"清洗后仍以完整 stem
+    的日期时间部分结尾"这一种弱匹配 —— 但**绝不截断 stem**。
+    """
+    for name in cloud_set:
+        base = name[:-4] if name.endswith('.mp4') else name
+        if base == f'{stem}{RENDERED_DIR_SUFFIX}':
+            return True
+        if base.startswith(stem):
+            rest = base[len(stem):]
+            if rest == RENDERED_DIR_SUFFIX or \
+                    re.fullmatch(r'\(\d+\)' + re.escape(RENDERED_DIR_SUFFIX), rest):
+                return True
+    return False
+
+
+def _pending_clean_names():
+    """读取 24h 延迟清理队列里的文件名（按 basename 比对，跨布局都通用）。
+
+    ⚠️⚠️ 2026-11-09 加：这是本工具**最重要的一道防护**，之前完全没有。
+
+    为什么必须有：``find_candidates`` 的判据是"本地有渲染产物就能删"。
+    但 DMR 的正式流程不是这样 —— 渲染完成后还要**上传**，上传成功才进
+    ``pending_clean.json`` 等 24 小时再删（给用户留出发现问题的窗口）。
+    "已渲染"和"已上传"是两个完全不同的阶段。
+
+    实盘：11-09 那一刻 34 条队列全是**未到期**的（0 条过期），而本工具
+    把其中 66 个文件（40.9GB）列成了"可安全清理"。谁要是顺手 ``--apply``，
+    就把刚渲染完、还没上传的内容全删了 —— 而且是绕过 24h 保护窗口。
+    这类误删不可恢复（源视频删了就再也渲染不出来）。
+
+    返回 ``None`` 表示队列读不出来 —— 此时按"全部保护"处理，宁可不清。
+    """
+    import json
+    q = os.path.join(ROOT, 'logs', 'pending_clean.json')
+    if not os.path.exists(q):
+        return set()
+    try:
+        with open(q, encoding='utf-8') as f:
+            data = json.load(f)
+        names = set()
+        for entry in data or []:
+            for pair in entry.get('pairs') or []:
+                for item in pair:
+                    if isinstance(item, str) and item:
+                        names.add(os.path.basename(item.replace('\\', '/')))
+        return names
+    except Exception as e:
+        print(f'  [警告] 读取延迟清理队列失败（{e}），'
+              f'按"全部保护"处理，不删除任何文件。')
+        return None
+
+
 def find_candidates(min_age_minutes=30):
     """找出可以安全清理的文件，返回 [(路径, 大小, 原因) ...] 和跳过列表。"""
     ok, skipped = [], []
     if not os.path.isdir(REPLAY):
         return ok, skipped
 
-    now = time.time()
-    for task_dir in sorted(os.listdir(REPLAY)):
-        sub = os.path.join(REPLAY, task_dir)
-        if not os.path.isdir(sub):
-            continue
-        if task_dir.endswith(RENDERED_DIR_SUFFIX):
-            continue        # 弹幕版目录是产物，不动
+    pending = _pending_clean_names()
 
-        rendered_dir = os.path.join(REPLAY, task_dir + RENDERED_DIR_SUFFIX)
+    now = time.time()
+    for src_dir, out_dir, task in _scan_layouts():
         rendered_files = set()
-        if os.path.isdir(rendered_dir):
-            rendered_files = {f for f in os.listdir(rendered_dir)
+        if out_dir and os.path.isdir(out_dir):
+            rendered_files = {f for f in os.listdir(out_dir)
                               if f.endswith('.mp4')}
 
         # 云端文件集合（用于判断"内容是否已在云端"），查不到为 None
-        cloud_set = cloud_files(task_dir)
+        cloud_set = cloud_files(task)
 
-        for f in sorted(os.listdir(sub)):
-            p = os.path.join(sub, f)
+        for f in sorted(os.listdir(src_dir)):
+            p = os.path.join(src_dir, f)
             if not os.path.isfile(p):
                 continue
 
@@ -131,22 +262,22 @@ def find_candidates(min_age_minutes=30):
                                    f'{min_age_minutes} 分钟）'))
                 continue
 
+            # 防护 3.5：还在 24h 延迟清理队列里 → 一律不动。
+            # 这是 DMR 自己会做的事，工具不该抢在它前面删。
+            if pending is None or f in pending:
+                skipped.append((p, '在 24 小时延迟清理队列中（交给 DMR 到期自动删）'))
+                continue
+
             # 防护 4：必须有"内容已在别处"的证据才能删，二选一：
-            #   a) 本地有渲染产物（（弹幕版）.mp4）
+            #   a) 本地有渲染产物（（弹幕版）.mp4，含 (n) 重名变体）
             #   b) 云端已有该分段（内容已备份，重渲染没意义）
             stem = os.path.splitext(f)[0]
-            expected = stem + RENDERED_DIR_SUFFIX + '.mp4'
-            if expected in rendered_files:
+            if _exists_rendered(stem, rendered_files):
                 ok.append((p, os.path.getsize(p), age_min, '本地已渲染'))
                 continue
-            # 云端校验（按文件名前缀匹配，因为云端名可能经过 emoji 清洗）
+            # 云端校验
             if cloud_set is not None:
-                # 云端文件名形如 "<源名>（弹幕版）.mp4"
-                cloud_hit = any(
-                    n.startswith(stem[:max(1, len(stem) - 6)])
-                    for n in cloud_set
-                )
-                if cloud_hit:
+                if _exists_in_cloud(stem, cloud_set):
                     ok.append((p, os.path.getsize(p), age_min, '云端已有'))
                     continue
                 skipped.append((p, '本地无渲染产物，云端也没有'))

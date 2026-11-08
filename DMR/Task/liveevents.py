@@ -1270,6 +1270,59 @@ class LiveEvents(BaseEvents):
         return True
 
 
+    def _persist_failed(self, group_id: str, vtype: str, idx: int,
+                        error_msg, prev_status: str | None = None) -> None:
+        """把"任务失败"落到状态库：状态 FAILED + last_error + attempts+1。
+
+        为什么不能只调 ``_sync_artifact(state=FAILED)``：
+        它走 ``set_artifact_state(key, state)`` 时不带 ``last_error``，
+        于是库里只剩一个干巴巴的 failed，**不知道失败原因**，下次重跑
+        还是原地踩坑。这里直接调 repository 把三者一起写。
+
+        ``attempts`` 用 bump 语义累加：失败一次算一次尝试，这样
+        "同一段反复渲染失败"能从 attempts 一眼看出来，而不是永远 0。
+
+        整个方法**不抛异常**：状态写库失败绝不能连累清理判定 ——
+        源视频该清还得清，否则回到 10-05 那个活体泄漏的老问题。
+        """
+        if self.state_repo is None:
+            return
+        kind = _VTYPE_TO_KIND.get(vtype)
+        if kind is None:
+            return
+        try:
+            seg_no = self._seg_no(group_id, vtype, idx)
+            if not isinstance(seg_no, int) or seg_no < 0:
+                return
+            if not self._ensure_session(group_id):
+                return
+            key = make_artifact_key(group_id, kind, seg_no)
+            reason = str(error_msg or '')[:500] or None
+            if self.state_repo.get_artifact(key) is None:
+                # 理论上失败前一定登记过，兜底补建，免得状态凭空消失
+                info = self._lookup_state(group_id, seg_no, vtype) or {}
+                path = getattr(info.get('file'), 'path', None)
+                self.state_repo.upsert_artifact(
+                    key, group_id, seg_no, kind, ArtifactState.FAILED,
+                    path=path, origin=info.get('origin'),
+                )
+                self.state_repo.set_artifact_state(
+                    key, ArtifactState.FAILED,
+                    last_error=reason, bump_attempts=True)
+            else:
+                self.state_repo.set_artifact_state(
+                    key, ArtifactState.FAILED,
+                    last_error=reason, bump_attempts=True)
+            self.logger.warning(
+                f'产物 {key} 已落库为 failed（上一次内存状态: {prev_status}），'
+                f'重启后不会再被当作"渲染中"重跑。'
+            )
+        except Exception as e:
+            self.logger.warning(
+                f'写库标记产物失败状态出错（{group_id}/{vtype}/{idx}）：'
+                f'{type(e).__name__}: {e}'
+            )
+
     def onTaskError(self, message:PipeMessage):
         """渲染 / 上传失败时的状态收敛（render/error、uploader/error）。
 
@@ -1287,6 +1340,23 @@ class LiveEvents(BaseEvents):
         （算终态，允许清理源文件、允许释放分组），然后补一次清理检查，
         免得这个失败的文件要等到下播才被处理。
 
+        ⚠️⚠️ 2026-11-09 补：失败状态**必须写库**（此前只改了内存）。
+            上面的修复只收敛了内存里的 state_dict，没有调用 _sync_artifact，
+            于是 `_STATUS_TO_STATE['failed']` 这条映射从来没真正生效过 ——
+            全库 state='failed' 的记录数为 0 就是证据。实盘后果：
+              渲染失败 → 内存标 failed（本次运行正确）
+                       → 状态库仍滞留在 'rendering'
+                       → 下次重启，_step0_sanitize_unstable 把它降成 'recorded'
+                       → 重新渲染失败一遍 → 无限循环，且 attempts 一直是 0
+            实盘事故（进程连续运行 6 天、从不重启，所以永远等不到 reconcile）：
+              君君.-2026年11月06日18点52分  渲染失败（产物 95s/134s）
+              vvu-2026年11月07日14点19分    渲染失败（产物 3096s/3589s）
+            两条都停在 rendering / attempts=0 / last_error=None。
+
+            注意 _sync_artifact(state=...) 只写状态不写错误原因，所以这里
+            额外调 set_artifact_state 把 last_error 与 attempts 一起落盘 ——
+            否则下次重启又得从头猜它为什么失败。
+
         注意：error 事件的 `data` 是**错误描述字符串**（不是 dict），
         分组只能靠 request_id 反查 —— 所以这里遍历全部 state_dict。
         """
@@ -1295,10 +1365,12 @@ class LiveEvents(BaseEvents):
         request_id = message.request_id
         ret_msgs = []
         touched_groups = set()
+        #: 本次被标 failed 的 (group_id, vtype, segment_id)，供后面写库
+        failed_slots = []
 
         if request_id is not None:
             for group_id, states in list(self.state_dict.items()):
-                for video_state in states:
+                for idx, video_state in enumerate(states):
                     for vtype, info in video_state.items():
                         if request_id not in (info.get('wait') or []):
                             continue
@@ -1307,11 +1379,18 @@ class LiveEvents(BaseEvents):
                         # wait 清空且仍停在"进行中"的状态 → 标 failed（终态）
                         if not info.get('wait') and info.get('status') in (
                                 'rendering', 'uploading'):
+                            prev_status = info.get('status')
                             info['status'] = 'failed'
+                            failed_slots.append((group_id, vtype, idx, prev_status))
                             self.logger.warning(
                                 f'{self.name}: {vtype} 标记为 failed（任务失败，不再等待），'
                                 f'文件: {getattr(info.get("file"), "path", "?")}'
                             )
+
+        # 失败状态写库（2026-11-09 补，见上方 docstring）。
+        # 放在循环外统一做，避免在遍历 state_dict 时夹带 I/O。
+        for group_id, vtype, idx, prev_status in failed_slots:
+            self._persist_failed(group_id, vtype, idx, message.msg, prev_status)
 
         # 失败的文件也要走一次清理判定，别等到下播
         if self.config['common_event_args'].get('auto_clean'):

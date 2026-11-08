@@ -44,26 +44,37 @@
 
 ---
 
-## 2. 当前状态快照（2026-11-04 22:40）
+## 2. 当前状态快照（2026-11-09 04:00）
 
 | 项 | 状态 |
 |---|---|
-| DMR 主进程 | 运行中（PID 会变，看 `logs/DMR-*.log`） |
+| DMR 主进程 | 运行中（PID 12724/12824，起于 **11-03 05:06 —— 已连续运行 6 天**） |
 | 守护进程 | 运行中（`DMR_Boot` 计划任务，session 0 常驻） |
-| 正在录制 | **SHU SDO温州店**（每小时一段，22:04 段落盘 126MB 且在增长） |
-| 任务配置 | `configs/DMR-*.yml` 共 **35 个**（配置在 `.gitignore` 里，不入仓库）；另有 105 个停用归档在 `configs/temp/` |
-| 状态库 | `logs/dmr_state.db`（SQLite，产物索引 + 启动对账） |
-| 录制目录 | `直播回放/原视频/<主播>/`（源视频+ass）、`直播回放/弹幕版/<主播>/`（成品）—— **新布局已端到端验证通过** |
-| 磁盘 | F 盘 926G，用 33G（4%） |
+| 正在录制 | 妲己崽崽（02:42 段落盘 → 03:44 渲染完 → 03:44 上传成功 → 进 24h 队列） |
+| 任务配置 | `configs/DMR-*.yml` 共 **43 个**（配置在 `.gitignore` 里，不入仓库）；停用归档在 `configs/temp/` |
+| 状态库 | `logs/dmr_state.db`（386 产物 / 91 场次 / 128 上传组）；**运行中状态 0 条残留、载荷全部可解析** |
+| 录制目录 | `直播回放/原视频/<主播>/`（源视频+ass）、`直播回放/弹幕版/<主播>/`（成品） |
+| 磁盘 | F 盘 926G，用 123G（14%）—— 5 天涨 90G，主因原视频+成品双份留存 |
 | 日志 | `logs/DMR-<日期>.log`；轮转策略 14 天 / 500MB |
-| 今日产出 | 46 个成品（`弹幕版/*.mp4`），0 次 QSV 降级 |
+| 今日产出 | 弹幕版累计 173 个成品；近 24h 渲染失败 **0 次**、真实 QSV 降级 0 次 |
+| 延迟清理队列 | 34 条，全部未到期（0 条过期）—— 队列机制本身健康 |
 
-**全链路实测证据（2026-11-04）**：
+**11-09 体检修掉的问题**（详见第 5 节坑速查）：
+1. `onTaskError` 失败不写库 → 产物永远卡 `rendering`（已修 + 5 个测试 + 反向验证）
+2. `clean_sources.py` 只认老布局 → 静默变成"无文件可清"（已修，双布局兼容）
+3. 同工具**无视 24h 队列** → 一次列出 66 个未上传文件（40.9GB）为"可删"（已加保护）
+4. 同工具云端校验用截断前缀 → 会把"渲染失败从未上传"的判成"云端已有"（已改严格比对）
+5. 状态库 2 条卡 `rendering` 的记录已按磁盘事实修正为 `recorded`
+6. 状态库 53 条载荷 JSON 非法转义已修复
+7. 清理 9 个真僵尸文件（2.91GB），删除前逐条核实成品**已上传网盘**
+
+**全链路实测证据（2026-11-09 03:41→03:44）**：
 ```
-21:04  原视频/…/21点04分.ts 落盘（801MB）+ .ass
-22:04  分段收尾、改名为正式名
-22:07  渲染完成 → 弹幕版/…/21点04分（弹幕版）.mp4（969MB，hevc_qsv，3 分钟渲 1 小时素材）
-22:15  上传成功 → 落入 24h 延迟清理队列（源 .ts 保留 24h 再删）
+03:41  原视频/妲己崽崽/02点42分.ts 落盘（分段 4）
+03:41  渲染派发（源 3541 秒 → 超时上限 36005 秒）
+03:44  渲染完成 → 弹幕版/…/02点42分（弹幕版）.mp4
+03:44  rclone 上传成功（~3 秒）
+03:44  延迟清理落盘（24.0 小时后执行）
 ```
 
 
@@ -149,6 +160,10 @@ main.py
 | **双击「添加主播」报退出码 `-1073741819`，控制台一行输出都没有** | 这个码 = `0xC0000005` 访问冲突（段错误）。真因是 `tools/add_room.py` 读剪贴板时 **`GetClipboardData` 没声明 `restype`** → ctypes 默认按 `c_int`（32 位）处理 → 64 位 HANDLE 高位被**静默截断** → 残指针传给 `GlobalLock` → 崩。**不是**当初以为的"剪贴板被占用"（10-23 加固错了方向，所以 11-06 又崩一次）。修法：所有返回/接收句柄的 API 显式声明 `c_void_p`，字符串用 `ctypes.wstring_at` 手动读，别用 `c_wchar_p` 作 restype。已锁进 `unit_tests/test_add_room.py` |
 | **任何 `ctypes` 调 Win32 API 崩得莫名其妙（无 traceback）** | 先怀疑**指针位宽**：不写 `restype` 就是 `c_int`=32 位，64 位下一切指针/句柄都会被截断。对照正确范式：`DMR/utils/instance_lock.py` 用 `wintypes.HANDLE`。这类崩溃发生在 C 层，Python 抓不到，所以**没有任何日志** —— 看到"双击后什么都没发生"就往这想 |
 | PowerShell 脚本块 `{ }` 不执行 | 包在 `{}` 里只构造不执行，要平铺语句 |
+| **`clean_sources.py` 报"没有可清理的文件"但磁盘明明堆着源视频** | 它按**老布局**扫目录（`直播回放/<主播>/` + `<主播>（弹幕版）/`），11-02 改成 `原视频/<主播>/` + `弹幕版/<主播>/` 后一个都对不上，整个工具静默退化。更狠的是它原来**无视 24h 延迟清理队列** —— 会把刚渲染完还没上传的也列成"可删"（实盘一次列了 66 个/40.9GB）。已在 11-09 修：双布局兼容 + 队列保护 + 崩溃时按"全部保护"处理 |
+| **`clean_sources.py` 说"云端已有"就删了源视频** | 原实现 `n.startswith(stem[:len(stem)-6])` —— 截掉末 6 字把 `14点19分` 削成 `...11月07日`，当天任意一场录制都能蒙对。险情：vvu 11-07 14:19、君君 11-06 18:52 这两段**渲染失败从未上传**，被误判成"云端已有"。已改为严格同名比对（含 `(n)` 变体），并禁止再出现截断前缀 |
+| **产物永远卡在 `rendering`，源视频永不清理，且重启后才"好转"一轮又复现** | `LiveEvents.onTaskError` 只改内存状态、**从不写库** → `_STATUS_TO_STATE['failed']` 形同虚设（全库 `state='failed'` 记录数长期为 0）。进程连续跑 6 天不重启，所以永远等不到 reconciler 兜底。已修：失败时 `_persist_failed()` 落库 FAILED + `last_error` + `attempts+1`。历史卡住的用 `tools/fix_stuck_artifacts.py --apply` 修 |
+| 状态库 `artifacts.data` 解析报 `Invalid \escape` | 旧版拼路径时一条用 `\`、一条用 `\\`，JSON 里出现 `\v` 非法转义。`decode_payload` 有容错（按空载荷处理）**不会挡启动**，但那行记录的全部字段会被静默丢弃。修：`tools/fix_state_payload.py --apply`（实盘 53 条，全是终态，不影响生产） |
 
 ---
 
@@ -191,12 +206,15 @@ Watch_DMR_Log.bat      :: 看实时日志
 :: 工具（都在 .venv\Scripts\python.exe 下跑）
 python tools\purge_task_state.py --apply     :: 停用主播后清状态库（默认预览）
 python tools\rename_orphans.py --apply       :: 孤儿 [正在录制] 分段登记（下次启动自动改名+渲染+上传）
+python tools\clean_sources.py [--apply]      :: ★ 清滞留源视频（默认预览；已接 24h 队列保护）
+python tools\fix_stuck_artifacts.py [--apply]:: ★ 修"卡在 rendering/uploading"的产物记录（按磁盘事实对账）
+python tools\fix_state_payload.py [--apply]  :: ★ 修状态库载荷的非法 JSON 转义
 python tools\restart_dmr.py --dry-run        :: 看重启将影响什么
 python tools\audit_cloud.py                  :: 云端 vs 本地对账
 python tools\build_index.py                  :: 重建录播索引页 index.html
 python tools\push_all.py [--apply]           :: ★ 一条命令推两个仓库（默认预览）
 python -m DMR.notify                         :: 实测通知链路
-python -m unittest discover -s unit_tests -t .   :: 514 个测试
+python -m unittest discover -s unit_tests -t .   :: 562 个测试
 python tools\check_imports.py                :: 模块导入完整性
 python tools\check_undefined_names.py        :: 未定义名字
 ```

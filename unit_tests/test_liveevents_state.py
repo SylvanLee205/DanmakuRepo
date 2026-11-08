@@ -393,5 +393,113 @@ class TestLiveSegmentSync(_SyncTestCase):
         self.assertEqual(artifact.path, self.path("seg1.flv"))
 
 
+class TestTaskErrorPersistence(_SyncTestCase):
+    """``onTaskError`` 必须把"失败"写库（2026-11-09 修的真 bug）。
+
+    历史缺陷：它只把内存里的 status 改成 'failed'，**从不调用 _sync_artifact**，
+    于是 ``_STATUS_TO_STATE['failed']`` 这条映射形同虚设 —— 全库 state='failed'
+    记录数为 0 就是证据。实盘后果是渲染失败的产物在库里永远停在 'rendering'，
+    下次重启被 reconciler 降级成 'recorded' 重跑一遍，反复循环且 attempts 恒 0。
+    """
+
+    def _running_dm_video(self, events, *, segment_id=1, group="g1"):
+        """造一个"正在渲染"的分段：内存 rendering + 库里 RENDERING。"""
+        output = self.path("seg1（弹幕版）.mp4")
+        state = self.blank_state() if hasattr(self, "blank_state") else None
+        if state is None:
+            state = {"src_video": {}, "dm_video": {}}
+        events.state_dict[group] = [{
+            "src_video": {"status": "uploaded", "file": None, "wait": [],
+                          "segment_id": segment_id},
+            "dm_video": {"status": "rendering", "wait": ["rid-1"],
+                         "file": SimpleNamespace(path=output),
+                         "segment_id": segment_id},
+        }]
+        events._sync_artifact(group, "dm_video", segment_id,
+                              path=output, state=ArtifactState.RENDERING)
+        return output
+
+    def _error_message(self, msg="渲染产物时长异常：源 134 秒 → 产物 95 秒"):
+        from DMR.utils import PipeMessage
+        return PipeMessage(source="render", target="replay/testtask",
+                           event="error", msg=msg, request_id="rid-1", data=msg)
+
+    def test_failed_state_is_written_to_db(self):
+        """核心断言：失败后库里必须是 FAILED，而不是继续停在 RENDERING。"""
+        events = self.make_events()
+        self._running_dm_video(events)
+
+        before = self.artifact("g1", ArtifactKind.DANMAKU_VIDEO, 1)
+        self.assertEqual(before.state, ArtifactState.RENDERING)
+
+        events.onTaskError(self._error_message())
+
+        after = self.artifact("g1", ArtifactKind.DANMAKU_VIDEO, 1)
+        self.assertEqual(after.state, ArtifactState.FAILED,
+                         '失败状态未写库：重启后会被 reconciler 当成「渲染中」重跑')
+
+    def test_error_reason_is_recorded(self):
+        """last_error 必须落盘，否则下次重跑还是原地踩同一个坑。"""
+        events = self.make_events()
+        self._running_dm_video(events)
+
+        events.onTaskError(self._error_message("产物仅 95 秒（71%）"))
+
+        artifact = self.artifact("g1", ArtifactKind.DANMAKU_VIDEO, 1)
+        payload = self.repo._raw_payload(artifact.artifact_id)
+        self.assertIn("95 秒", payload.get("last_error") or "",
+                      "last_error 没写进载荷：失败原因丢失")
+
+    def test_attempts_are_bumped(self):
+        """attempts 要能累加，否则"同一段反复失败"在库里看不出来。"""
+        events = self.make_events()
+        self._running_dm_video(events)
+
+        events.onTaskError(self._error_message())
+        first = self.repo._raw_payload(
+            self.artifact("g1", ArtifactKind.DANMAKU_VIDEO, 1).artifact_id
+        ).get("attempts")
+        self.assertEqual(first, 1, "首次失败后 attempts 应为 1")
+
+        # 再来一次（模拟重启后重新渲染又失败）
+        events._sync_artifact("g1", "dm_video", 1, state=ArtifactState.RENDERING)
+        events.state_dict["g1"][0]["dm_video"].update(
+            {"status": "rendering", "wait": ["rid-2"]})
+        from DMR.utils import PipeMessage
+        events.onTaskError(PipeMessage(source="render", target="replay/testtask",
+                                       event="error", msg="又失败",
+                                       request_id="rid-2", data="又失败"))
+
+        second = self.repo._raw_payload(
+            self.artifact("g1", ArtifactKind.DANMAKU_VIDEO, 1).artifact_id
+        ).get("attempts")
+        self.assertEqual(second, 2, "attempts 未累加")
+
+    def test_db_failure_does_not_break_clean_check(self):
+        """写库出错不能让清理判定跟着崩 —— 否则回到 10-05 的活体泄漏。"""
+        events = self.make_events(
+            common_event_args={"auto_render": False, "auto_upload": False,
+                               "auto_clean": True, "auto_transcode": False},
+        )
+        self._running_dm_video(events)
+
+        class _Boom:
+            def __getattr__(self, item):
+                raise RuntimeError("状态库炸了")
+
+        events.state_repo = _Boom()
+        # 不抛异常即通过
+        events.onTaskError(self._error_message())
+
+    def test_no_repo_is_noop(self):
+        """没注入状态库时（纯运行时模式）照样能跑，不报错。"""
+        events = self.make_events(with_repo=False)
+        self._running_dm_video(events)
+        events.state_repo = None
+        events.onTaskError(self._error_message())
+        self.assertEqual(events.state_dict["g1"][0]["dm_video"]["status"],
+                         "failed", "内存状态仍应被收敛为 failed")
+
+
 if __name__ == "__main__":
     unittest.main()
