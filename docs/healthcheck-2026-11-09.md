@@ -1,6 +1,6 @@
 # 2026-11-09 例行体检（04:00 前后）
 
-用户一句话："今天也帮我检查一下吧"。这次体检挖出 **3 个真 bug**（不是配置问题、
+用户一句话："今天也帮我检查一下吧"。这次体检挖出 **4 个真 bug**（不是配置问题、
 不是磁盘问题），其中两个直接威胁数据安全。
 
 ---
@@ -237,12 +237,15 @@ cloud_hit = any(n.startswith(stem[:max(1, len(stem) - 6)]) for n in cloud_set)
 ```
 Ran 566 tests — OK (expected failures=5)
 ```
-新增 28 个：
-- `test_liveevents_state.py::TestTaskErrorPersistence` — 5 个（失败落库）
-- `test_clean_sources.py` — 20 个（云端严格匹配 6 / 成品匹配 3 / 布局扫描 3 / 队列保护 4 / 跳过上传语义 4）
-- `test_state_maintenance_tools.py` — 12 个（转义修复 4 / 目标语义 4 / dry-run 2 / 端到端 1）
+本轮体检累计新增 **37 个**（基线 529 → 562 → 566）：
+- `9d16ef8` 新增 **33 个**：`test_liveevents_state.py::TestTaskErrorPersistence` 5 个（失败落库）、
+  `test_clean_sources.py` 16 个（云端严格匹配 6 / 成品匹配 3 / 布局扫描 3 / 队列保护 4）、
+  `test_state_maintenance_tools.py` 12 个（转义修复 / 目标语义 / dry-run / 端到端）
+- `659634e` 新增 **4 个**：`test_clean_sources.py::TestSkipUploadSemantics`（跳过上传语义 + 24h 后悔期）
 
-三个新测试组都做了**反向验证**（回退修复 → 测试立刻失败），确认不是空转。
+三组都做了**反向验证**（回退修复 → 测试立刻失败），确认不是空转。
+> 2026-11-09 全库复核更正：原文写"新增 28 个"且分项 5+20+12=37 自相矛盾，
+> 已按 `git show` 的新增用例数与 `grep -c 'def test_'` 校正。
 
 ---
 

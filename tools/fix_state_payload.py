@@ -43,8 +43,10 @@ import time
 
 try:
     sys.stdout.reconfigure(errors='replace')
-except Exception:
-    pass
+except Exception as e:
+    # 无人值守脚本不能因控制台编码问题崩，但铁律禁止静默吞异常
+    print(f'[警告] stdout 重配置失败（{type(e).__name__}: {e}），继续运行',
+          file=sys.stderr)
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 DB = os.path.join(ROOT, 'logs', 'dmr_state.db')
@@ -108,9 +110,9 @@ def main():
             continue
         try:
             json.loads(raw)
-            continue                      # 本来就好的
-        except Exception:
-            pass
+            continue                      # 本来就好的，不用修
+        except json.JSONDecodeError:
+            pass                          # 确认是坏载荷，落到下面的 _fix_escapes
         fixed = _fix_escapes(raw)
         if fixed is None:
             unfixable.append((r['artifact_id'], r['state']))

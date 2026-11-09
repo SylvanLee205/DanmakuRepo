@@ -18,7 +18,7 @@
     5. 在 `logs/pending_clean.json` 24h 延迟队列里的一律不动
        <- DMR 自己会到期删，工具不许抢跑；队列读不出来时按"全部保护"
     6. 默认 dry-run，加 --apply 才真删
-    7. 删除前打印清单让用户确认
+    7. 默认 dry-run 打印清单；--apply 直接删（确认靠先跑一次不带 --apply）
 
 ⚠️⚠️ 关于「跳过上传」机制 —— 别把"已上传云端"当成删除前提（2026-11-09）
     `render_args.dmrender.skip_upload_rule`：横屏是必选前提，码率 ≥2500kbps
@@ -190,8 +190,11 @@ def _exists_in_cloud(stem, cloud_set):
     若不修，--apply 会把它们删掉，那两段直播就永久没有弹幕版了。
 
     现在改为严格比对：云端名必须是 ``<stem>（弹幕版）.mp4`` 或带 ``(n)``
-    重名变体。emoji 清洗可能改动文件名，所以额外允许"清洗后仍以完整 stem
-    的日期时间部分结尾"这一种弱匹配 —— 但**绝不截断 stem**。
+    重名变体，**绝不截断 stem**，也不做 emoji 清洗后的模糊匹配。
+    代价：云端名含 emoji 时会漏判（判据 b 失效），方向保守 —— 宁可不清、
+    不可错清。真要覆盖这批文件，参考 ``tools/audit_cloud.py`` 的 ``safe``
+    清洗逻辑另行实现。
+    （2026-11-09 全库复核：原注释声称"额外允许弱匹配"，实现里并没有，已改正。）
     """
     for name in cloud_set:
         base = name[:-4] if name.endswith('.mp4') else name
@@ -225,6 +228,10 @@ def _pending_clean_names():
     import json
     q = os.path.join(ROOT, 'logs', 'pending_clean.json')
     if not os.path.exists(q):
+        # 「队列文件不存在」和「队列为空」是两回事：前者说明这道防护本次
+        # 没生效，不能静默当成后者，否则会误以为文件都受队列保护。
+        print('  [警告] 未找到 24h 延迟清理队列（pending_clean.json），'
+              '队列防护本次不生效，仅靠 1440 分钟后悔期兜底。')
         return set()
     try:
         with open(q, encoding='utf-8') as f:

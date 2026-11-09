@@ -1,6 +1,6 @@
 # 交接文档 · DanmakuRepo（AI 接手请先读这一份）
 
-> 最后更新：**2026-11-04 22:40**（实测快照：21:04 分段 → 22:07 渲染完成 → 22:15 上传成功，全链路通）
+> 最后更新：**2026-11-09 10:40**（11-09 例行体检 + 跳过上传机制复核；状态快照见第 2 节）
 >
 > 本文件是**给下一个接手者（尤其是 AI）**的入口。先读这一份，再按第 1 节指路读别的。
 > 读完能回答"这项目在干什么、现在什么状态、哪些事不能做、出事该查哪" = 交接完成。
@@ -16,7 +16,7 @@
 |---|---|
 | 本机目录 | `F:\DanmakuRepo` |
 | 公开仓库（代码） | `github.com/SylvanLee205/DanmakuRepo` —— 默认分支 **main** |
-| 私有仓库（含配置+状态库） | `github.com/SylvanLee205/DanmakuRepo-Full` —— 分支 **main** |
+| 私有仓库（含配置+状态库） | `github.com/SylvanLee205/DanmakuRepo-Full` —— 远端分支 **main**；本地 worktree `F:\DanmakuRepo-full` 在 **`full-backup`** 分支（`push_all.py` 生成完整副本快照后推 `full/main`） |
 | **当前发行版** | **`v6.1.0`**（2026-11-04）—— 说明见 `docs/RELEASE-v6.1.0.md` |
 | Python | 3.11，项目内 venv：`.venv\Scripts\python.exe` |
 | 主程序入口 | `main.py`（`python main.py`） |
@@ -156,7 +156,7 @@ main.py
 | **`push_all.py` 说"工作区有未提交改动"但 `git diff` 是空的** | 全是**未跟踪**的垃圾文件（`.DS_Store` 等）。`master_dirty()` 只看 `git status --porcelain` 有没有输出，`??` 也算脏。`git diff` 看不到未跟踪文件，所以极易误判。用 `git status --porcelain` 看 `??` 那几行 |
 | `.DS_Store` 越清越多、清不完 | 从 Mac / Finder 浏览这个 SMB 共享**必然**在 Windows 盘生成。只能靠 `.gitignore` 挡住（已加 `.DS_Store` / `._*` / `Thumbs.db` / `desktop.ini`），不要指望手动删干净 |
 | 心跳日志里的主播数跟 `configs/` 实际数量对不上 | `main.py` 心跳曾用启动时快照 `n_tasks`，热加载增删主播后不刷新（实测写 33、实际 35）。已改成每次现取 `dmr.engine.task_dict` |
-| `requirements.txt` 显示"内容相同却算改动" | 这台机器 `core.autocrlf=true`（PortableGit 全局配置），工作区文件被 checkout 成 CRLF、索引里是 LF。`txt` 没在 `.gitattributes` 里钉 `eol`，所以来回抖。真要钉就加 `*.txt text eol=lf`，但**注意**别把需要 CRLF 的文件扫进去 |
+| `requirements.txt` 显示"内容相同却算改动" | `core.autocrlf=true`（PortableGit 全局配置），工作区 CRLF / 索引 LF 来回抖。**已修**：`.gitattributes` 已补 `*.txt` / `*.json` / `*.toml` / `*.ini` 和 `.gitignore` / `.gitattributes` 自身 `text eol=lf`；`*.bat` / `*.cmd` / `*.ps1` 仍锁 `eol=crlf`，别把它们扫进去 |
 | **双击「添加主播」报退出码 `-1073741819`，控制台一行输出都没有** | 这个码 = `0xC0000005` 访问冲突（段错误）。真因是 `tools/add_room.py` 读剪贴板时 **`GetClipboardData` 没声明 `restype`** → ctypes 默认按 `c_int`（32 位）处理 → 64 位 HANDLE 高位被**静默截断** → 残指针传给 `GlobalLock` → 崩。**不是**当初以为的"剪贴板被占用"（10-23 加固错了方向，所以 11-06 又崩一次）。修法：所有返回/接收句柄的 API 显式声明 `c_void_p`，字符串用 `ctypes.wstring_at` 手动读，别用 `c_wchar_p` 作 restype。已锁进 `unit_tests/test_add_room.py` |
 | **任何 `ctypes` 调 Win32 API 崩得莫名其妙（无 traceback）** | 先怀疑**指针位宽**：不写 `restype` 就是 `c_int`=32 位，64 位下一切指针/句柄都会被截断。对照正确范式：`DMR/utils/instance_lock.py` 用 `wintypes.HANDLE`。这类崩溃发生在 C 层，Python 抓不到，所以**没有任何日志** —— 看到"双击后什么都没发生"就往这想 |
 | PowerShell 脚本块 `{ }` 不执行 | 包在 `{}` 里只构造不执行，要平铺语句 |
@@ -182,7 +182,9 @@ main.py
 3. **Server酱³ 的 key 必须重置**：旧 key 曾硬编码在 `notify.py` 里并进了 git 历史
    （公开仓库可见）。代码已改成从 `.login_info/notify_key.txt` 读，但**历史里那份
    仍有效** —— 去 Server酱³ 后台重置，把新 key 写进那个文件（第一行 key、第二行 uid）。
-   **这是唯一必须由用户本人完成的事项**（安全项，优先级最高）。
+   **这是唯一必须由用户本人完成的事项**（安全项）。⚠️ 2026-11-09 用户明确表态：
+   "serve酱不急，那个几乎没有额度啥的，安全的很，我那小仓库肯定想让人看到都难" ——
+   **按用户判断不急，别催**；但重置动作本身仍只能由用户本人在后台完成。
 4. **Windows 更新改成不自动重启**（蓝屏根因链条 = 更新→重启→18 分钟后显卡驱动炸）。
 5. **Linux 移植**：用户暂缓。障碍全在启动层（bat/计划任务/COM），依赖层有 manylinux 轮子。
    清单见 `docs/跨平台.md`。**不建议仅为"更稳"重装** —— 实测 45 天仅 1 次蓝屏，且是 GPU 驱动。
@@ -245,7 +247,8 @@ python tools\check_undefined_names.py        :: 未定义名字
 
 ## 8b. 想把项目"交给"别人 / 另一个 AI 时怎么做
 
-生产目录有 **14 GB**（绝大部分是录播），不能直接打包发。三种方式：
+生产目录持续在涨（2026-11-09 实测 **F 盘用 123 GB / 14%**，原视频约 46G、
+弹幕版约 76G），不能直接打包发。三种方式：
 
 | 方式 | 命令 | 说明 |
 |---|---|---|

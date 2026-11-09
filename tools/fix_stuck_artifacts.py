@@ -44,8 +44,10 @@ import time
 
 try:
     sys.stdout.reconfigure(errors='replace')
-except Exception:
-    pass
+except Exception as e:
+    # 无人值守脚本不能因控制台编码问题崩，但铁律禁止静默吞异常
+    print(f'[警告] stdout 重配置失败（{type(e).__name__}: {e}），继续运行',
+          file=sys.stderr)
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 DB = os.path.join(ROOT, 'logs', 'dmr_state.db')
@@ -162,7 +164,15 @@ def _merge(con, artifact_id, note):
     import json
     row = con.execute('SELECT data FROM artifacts WHERE artifact_id=?',
                       (artifact_id,)).fetchone()
-    d = json.loads(row['data'] or '{}') if row else {}
+    try:
+        d = json.loads(row['data'] or '{}') if row else {}
+    except Exception as e:
+        # 坏载荷（旧版拼路径的非法转义）不该让 --apply 在备份之后、
+        # UPDATE 循环中途抛异常退出；也不许当成空载荷悄悄覆盖原始内容。
+        print(f'  [警告] {artifact_id} 载荷不可解析（{type(e).__name__}），'
+              f'保留原文并跳过字段合并；请先跑 tools/fix_state_payload.py',
+              file=sys.stderr)
+        return (row['data'] if row else '') or '{}'  # 原样退回
     d['last_error'] = note
     # 渲染中断留下的半成品信息一律清掉，免得下次误用
     d['part_path'] = None

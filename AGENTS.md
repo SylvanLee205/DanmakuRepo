@@ -8,7 +8,7 @@
 
 **DanmakuRepo（DMR）**：Windows 上的无人值守直播归档系统。
 自动发现 B 站/抖音开播 → 录制 → 拉弹幕转 `.ass` → ffmpeg 渲染"弹幕版" →
-推百度网盘 → 微信通知。7×24 跑着，33 个主播。
+推百度网盘 → 微信通知。7×24 跑着，43 个主播（2026-11-09 实盘）。
 
 **生产目录**：`F:\DanmakuRepo`（本机）· Python 3.11 venv · 主入口 `main.py`
 
@@ -17,7 +17,7 @@
 1. **`HANDOVER.md`** —— 状态快照、架构地图、**12 条铁律**、坑速查表、待办、命令速查
 2. **`docs/maintainer-log.md`** —— 完整历史：每处改动的原因与踩过的坑（末尾是最近的大改）
 3. **`docs/project_state.md`** —— 设计取舍
-4. **`tools/README.md`** —— 52 个工具脚本按用途分组（找东西按"我要干什么"翻）
+4. **`tools/README.md`** —— 54 个工具脚本按用途分组（找东西按"我要干什么"翻）
 
 读完后你必须能回答：*这项目在干什么 / 现在什么状态 / 哪些事不能做 / 出事查哪*。
 答不上来就别改代码，先继续读。
@@ -49,23 +49,24 @@
 ## 验证
 
 ```bat
-python -m unittest discover -s unit_tests -t .   :: 514 个测试
+python -m unittest discover -s unit_tests -t .   :: 566 个测试
 python tools\check_imports.py                     :: 模块导入完整性
 python tools\check_undefined_names.py             :: 未定义名字
 python tools\doctor.py                            :: 体检（--export 出诊断包）
 ```
 
-## 当前状态（2026-11-03 01:40 快照，细节看 HANDOVER.md 第 2 节）
+## 当前状态（2026-11-09 10:40 快照，细节看 HANDOVER.md 第 2 节）
 
-- DMR + 守护进程运行中；**TG家里蹲、掉了颗兔牙正在录制**
-- 任务配置 33 个；状态库 `logs/dmr_state.db`
+- DMR + 守护进程运行中（进程自 11-03 05:06 起连跑 6 天，10:06 心跳正常）
+- 任务配置 43 个；状态库 `logs/dmr_state.db`
 - 录制目录：`直播回放/原视频/<主播>/` + `直播回放/弹幕版/<主播>/`
 - 计划任务：`DMR_Boot` / `DMR_SessionWatch` / `DMR_Desktop` / `DMR_云端上传审计` / `DMR_配置快照`
 
 ## 未验证 / 待办（别当成已完成）
 
-1. 目录新布局（`原视频/` + `弹幕版/`）代码有测试兜底，但**尚未经一次真实开播端到端验证**
+1. ~~目录新布局（`原视频/` + `弹幕版/`）未经端到端验证~~ **✅ 2026-11-04 已验证通过**
 2. `hevc_qsv` 硬件编码不稳定（与 Intel Arc 蓝屏 0x113 可能同源）—— 建议更新显卡驱动
 3. Server酱³ 的 key 曾在代码里硬编码并进了 git 历史 → **已外置到 `.login_info/notify_key.txt`，
-   但旧 key 仍需去 Server酱³ 后台重置**（历史里的那份要作废）
+   旧 key 仍可去后台重置**（历史里的那份要作废）。⚠️ 但用户 11-06 明确表态
+   "serve酱不急，几乎没有额度，安全的很" —— **不要催用户做这件事**
 4. Linux 移植未做（启动层是 bat/计划任务/COM），清单见 `docs/跨平台.md`

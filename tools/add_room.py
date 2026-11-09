@@ -32,8 +32,9 @@ import sys
 try:
     sys.stdout.reconfigure(errors='replace')
     sys.stderr.reconfigure(errors='replace')
-except Exception:
-    pass
+except Exception as e:
+    print(f'[警告] 控制台重配置失败（{type(e).__name__}: {e}），继续运行',
+          file=sys.stderr)
 
 UP = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 CONFIGS = os.path.join(UP, 'configs')
@@ -147,8 +148,12 @@ def _read_clipboard_powershell() -> str:
     """
     try:
         import subprocess
+        # 铁律：venv 进程 PATH 里没有 System32，外部命令一律走 DMR/paths.py。
+        if UP not in sys.path:
+            sys.path.insert(0, UP)
+        from DMR.paths import powershell_exe
         out = subprocess.run(
-            ['powershell', '-NoProfile', '-Command',
+            [powershell_exe(), '-NoProfile', '-Command',
              'Get-Clipboard -Raw -Format Text -ErrorAction SilentlyContinue'],
             capture_output=True, timeout=15, stdin=subprocess.DEVNULL)
         if out.returncode != 0:

@@ -65,8 +65,10 @@ class TestEscapeFixer(unittest.TestCase):
     def test_unicode_escape_preserved(self):
         """\\uXXXX 是合法转义，必须原样保留。"""
         raw = r'{"a": "\u4e2d\u6587"}'
-        self.assertIsNone(self.m._fix_escapes(raw) and None)  # 本来就合法
-        self.assertEqual(json.loads(raw)['a'], '中文')
+        fixed = self.m._fix_escapes(raw)
+        self.assertEqual(fixed, raw,
+                         '合法的 unicode 转义被误当成非法转义改写')
+        self.assertEqual(json.loads(fixed)['a'], '中文')
 
     def test_ambiguous_trailing_backslash_is_not_guessed(self):
         """字符串值结尾是单个反斜杠时属于**结构歧义**（\\" 会被当成引号转义），
