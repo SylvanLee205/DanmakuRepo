@@ -12,15 +12,38 @@
 防护清单（每一条都对应一次真实教训）：
     1. 跳过 `[正在录制]` 前缀的文件        <- 2026-10-07 事故
     2. 跳过 `.part` / `.tmp` / `.converting` 等中间文件
-    3. 只处理超过 N 分钟没被修改的文件（默认 30 分钟）  <- 防正在写入
+    3. 只处理超过 N 分钟没被修改的文件（默认 **1440 分钟 = 24 小时**）
+       <- 对齐 clean_args_task_default 的 86400 秒后悔期，见下方"跳过上传"
     4. 必须有对应的渲染产物（`（弹幕版）.mp4`）才允许删   <- 防删掉还没渲染的
-    5. 默认 dry-run，加 --apply 才真删
-    6. 删除前打印清单让用户确认
+    5. 在 `logs/pending_clean.json` 24h 延迟队列里的一律不动
+       <- DMR 自己会到期删，工具不许抢跑；队列读不出来时按"全部保护"
+    6. 默认 dry-run，加 --apply 才真删
+    7. 删除前打印清单让用户确认
+
+⚠️⚠️ 关于「跳过上传」机制 —— 别把"已上传云端"当成删除前提（2026-11-09）
+    `render_args.dmrender.skip_upload_rule`：横屏是必选前提，码率 ≥2500kbps
+    或帧率 ≥40fps 再命中任意一个 → **三条里命中两条就整组跳过上传**
+    （B站和网盘都不传）。配置里 `skip_min_matches: 1` 看着像"命中一条"，
+    那是因为横屏被排除在计数外，实际语义就是"横屏 + 一个数值条件"。
+
+    `configs/global.yml` 的原话：
+        跳过上传 **不影响本地文件**：
+        原视频照常按 clean_args 删除，弹幕版按 clean_args 留存（不上传也不删）。
+
+    所以命中规则的分段**云端永远查不到**，但源视频本来就该删、弹幕版永久
+    留本地。判据 4「本地有弹幕版成品」是**独立成立**的充分条件，云端同名
+    只是「本地成品被移走、内容已备份」这种少数情形的补充证据，不是必要
+    条件。反过来把云端当硬门槛，会让这批源视频永远滞留在磁盘上。
+
+    另外：命中跳过上传的分段**不产生上传事件**，10-23 之前根本进不了清理
+    判定（实盘积压过 42.9GB）。这类历史遗留文件不在 pending_clean 队列里，
+    判据 5 保护不到它们 —— 只能靠判据 3 的 24h 后悔期兜住。这就是默认值
+    从 30 分钟改成 1440 分钟的原因，不要改回去。
 
 用法：
     python tools\\clean_sources.py            # 只报告（dry-run）
     python tools\\clean_sources.py --apply    # 真正删除
-    python tools\\clean_sources.py --apply --min-age 120   # 只清 2 小时以上的
+    python tools\\clean_sources.py --apply --min-age 120   # 显式缩短后悔期（不推荐）
 """
 import argparse
 import os
@@ -219,7 +242,7 @@ def _pending_clean_names():
         return None
 
 
-def find_candidates(min_age_minutes=30):
+def find_candidates(min_age_minutes=1440):
     """找出可以安全清理的文件，返回 [(路径, 大小, 原因) ...] 和跳过列表。"""
     ok, skipped = [], []
     if not os.path.isdir(REPLAY):
@@ -269,8 +292,12 @@ def find_candidates(min_age_minutes=30):
                 continue
 
             # 防护 4：必须有"内容已在别处"的证据才能删，二选一：
-            #   a) 本地有渲染产物（（弹幕版）.mp4，含 (n) 重名变体）
-            #   b) 云端已有该分段（内容已备份，重渲染没意义）
+            #   a) 本地有弹幕版成品 —— **独立充分**，不需要云端有。
+            #      命中 skip_upload_rule 的分段故意不上传（三条命中两条），
+            #      云端永远查不到，但配置明确写了源视频照常删、弹幕版
+            #      永久留本地。把云端当硬门槛会让这批源视频永远滞留。
+            #   b) 本地成品已被移走、但云端确有同名成品 —— 内容已备份。
+            # 注意顺序：a 先判，所以"云端查不到"不会误伤跳过上传的分段。
             stem = os.path.splitext(f)[0]
             if _exists_rendered(stem, rendered_files):
                 ok.append((p, os.path.getsize(p), age_min, '本地已渲染'))
@@ -292,8 +319,9 @@ def main():
     ap = argparse.ArgumentParser(description='安全清理源文件/弹幕文件')
     ap.add_argument('--apply', action='store_true',
                     help='真正删除（默认只报告，不删）')
-    ap.add_argument('--min-age', type=int, default=30, metavar='MIN',
-                    help='只清理最后修改早于 MIN 分钟的文件（默认 30）')
+    ap.add_argument('--min-age', type=int, default=1440, metavar='MIN',
+                    help='只清理最后修改早于 MIN 分钟的文件（默认 1440 = 24h，'
+                         '与 clean_args 后悔期一致；调小会绕过保护窗口）')
     ap.add_argument('--show-skipped', action='store_true',
                     help='也列出被跳过保护的文件')
     opt = ap.parse_args()

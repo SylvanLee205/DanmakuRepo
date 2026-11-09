@@ -164,6 +164,8 @@ main.py
 | **`clean_sources.py` 说"云端已有"就删了源视频** | 原实现 `n.startswith(stem[:len(stem)-6])` —— 截掉末 6 字把 `14点19分` 削成 `...11月07日`，当天任意一场录制都能蒙对。险情：vvu 11-07 14:19、君君 11-06 18:52 这两段**渲染失败从未上传**，被误判成"云端已有"。已改为严格同名比对（含 `(n)` 变体），并禁止再出现截断前缀 |
 | **产物永远卡在 `rendering`，源视频永不清理，且重启后才"好转"一轮又复现** | `LiveEvents.onTaskError` 只改内存状态、**从不写库** → `_STATUS_TO_STATE['failed']` 形同虚设（全库 `state='failed'` 记录数长期为 0）。进程连续跑 6 天不重启，所以永远等不到 reconciler 兜底。已修：失败时 `_persist_failed()` 落库 FAILED + `last_error` + `attempts+1`。历史卡住的用 `tools/fix_stuck_artifacts.py --apply` 修 |
 | 状态库 `artifacts.data` 解析报 `Invalid \escape` | 旧版拼路径时一条用 `\`、一条用 `\\`，JSON 里出现 `\v` 非法转义。`decode_payload` 有容错（按空载荷处理）**不会挡启动**，但那行记录的全部字段会被静默丢弃。修：`tools/fix_state_payload.py --apply`（实盘 53 条，全是终态，不影响生产） |
+| **看到"云端没有这个成品"就判定清理出问题 / 把"已上传"当删除前提** | 有「跳过上传」机制：`render_args.dmrender.skip_upload_rule` = 横屏必选 + (码率≥2500kbps 或 帧率≥40fps) 任一命中 → **三条里命中两条就整组不上传**（B站+网盘都不传）。配置写 `skip_min_matches: 1` 是因为横屏被排除在计数外，别误读成"命中一条"。`global.yml` 原文：**跳过上传不影响本地文件 —— 原视频照常按 clean_args 删，弹幕版永久留本地（不上传也不删）**。所以云端查不到 ≠ 该留着源视频；反过来把云端当硬门槛会让这批源文件永久滞留。`tools/audit_cloud.py` 已正确排除命中的文件，可参考它的 `should_skip_upload()` |
+| **磁盘越用越多，想缩短清理延迟 / 把弹幕版挪去冷存** | 弹幕版**永久留本地是用户硬性要求**（`tools/clean_confirmed_uploaded.py` 开头），缩短 `delay` 只影响原视频周转区，对增长无效。单调增长是预期行为。真风险是命中跳过上传的成品**只有本地一份、无云端备份** —— 该做异地备份，不是删本地。另：`clean_sources.py` 默认后悔期必须是 1440 分钟（24h），因为跳过上传的分段不产生上传事件、可能没进 `pending_clean.json`，队列防护兜不住 |
 
 ---
 
@@ -206,7 +208,7 @@ Watch_DMR_Log.bat      :: 看实时日志
 :: 工具（都在 .venv\Scripts\python.exe 下跑）
 python tools\purge_task_state.py --apply     :: 停用主播后清状态库（默认预览）
 python tools\rename_orphans.py --apply       :: 孤儿 [正在录制] 分段登记（下次启动自动改名+渲染+上传）
-python tools\clean_sources.py [--apply]      :: ★ 清滞留源视频（默认预览；已接 24h 队列保护）
+python tools\clean_sources.py [--apply]      :: ★ 清滞留源视频（默认预览；24h 队列保护 + 24h 后悔期）
 python tools\fix_stuck_artifacts.py [--apply]:: ★ 修"卡在 rendering/uploading"的产物记录（按磁盘事实对账）
 python tools\fix_state_payload.py [--apply]  :: ★ 修状态库载荷的非法 JSON 转义
 python tools\restart_dmr.py --dry-run        :: 看重启将影响什么
@@ -214,7 +216,7 @@ python tools\audit_cloud.py                  :: 云端 vs 本地对账
 python tools\build_index.py                  :: 重建录播索引页 index.html
 python tools\push_all.py [--apply]           :: ★ 一条命令推两个仓库（默认预览）
 python -m DMR.notify                         :: 实测通知链路
-python -m unittest discover -s unit_tests -t .   :: 562 个测试
+python -m unittest discover -s unit_tests -t .   :: 566 个测试
 python tools\check_imports.py                :: 模块导入完整性
 python tools\check_undefined_names.py        :: 未定义名字
 ```

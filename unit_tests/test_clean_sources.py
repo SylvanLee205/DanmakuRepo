@@ -20,6 +20,13 @@
 3. **完全无视 24h 延迟清理队列**（最严重）
    工具的判据是"本地已渲染就能删"，但正式流程是渲染→上传→等 24h→才删。
    体检时 34 条队列全是未到期的，工具却把其中 66 个文件（40.9GB）列成可删。
+
+4. **把"已上传云端"当成删除前提，忽略「跳过上传」机制**（2026-11-09 补）
+   `skip_upload_rule`：横屏 + (码率≥2500 或 帧率≥40) = 三条命中两条 →
+   整组不上传。这些分段**云端永远查不到**，但配置写明"原视频照常清理、
+   弹幕版永久留本地"，源视频本来就该删。把云端当硬门槛会让它们全滞留。
+   另外它们不产生上传事件，可能根本不在 pending_clean 队列里 —— 判据 5
+   保护不到，只能靠 24h 后悔期兜底，所以默认 min_age 从 30 改成 1440。
 """
 import importlib.util
 import json
@@ -27,6 +34,7 @@ import os
 import re
 import shutil
 import tempfile
+import time
 import unittest
 
 MODULE_PATH = os.path.join(
@@ -237,6 +245,87 @@ class TestPendingCleanGuard(unittest.TestCase):
 
         ok, skipped = self.m.find_candidates(min_age_minutes=30)
         self.assertNotIn(p, [x[0] for x in ok])
+
+
+class TestSkipUploadSemantics(unittest.TestCase):
+    """命中「跳过上传」的分段：云端查不到，但源视频仍应可清。
+
+    这是用户 2026-11-09 提醒的机制：三条命中两条就不上传。
+    这类分段云端永远没有同名文件，且因为不产生上传事件可能不在
+    pending_clean 队列里。工具必须只凭"本地有弹幕版成品"放行。
+    """
+
+    def setUp(self):
+        self.m = load_module()
+        self.tmp = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, self.tmp, True)
+        self._orig_root, self._orig_replay = self.m.ROOT, self.m.REPLAY
+        self.m.ROOT = self.tmp
+        self.m.REPLAY = os.path.join(self.tmp, '直播回放')
+        os.makedirs(os.path.join(self.tmp, 'logs'), exist_ok=True)
+        # 队列为空：模拟"跳过上传 → 没进队列"的历史遗留
+        with open(os.path.join(self.tmp, 'logs', 'pending_clean.json'),
+                  'w', encoding='utf-8') as f:
+            json.dump([], f)
+        self._orig_cloud = self.m.cloud_files
+
+    def tearDown(self):
+        self.m.ROOT, self.m.REPLAY = self._orig_root, self._orig_replay
+        self.m.cloud_files = self._orig_cloud
+
+    def _make_old_source_with_render(self, name):
+        src = os.path.join(self.m.REPLAY, '原视频', '甲')
+        out = os.path.join(self.m.REPLAY, '弹幕版', '甲')
+        os.makedirs(src, exist_ok=True)
+        os.makedirs(out, exist_ok=True)
+        p = os.path.join(src, name)
+        with open(p, 'w') as f:
+            f.write('x')
+        old = 100000                      # 远早于 24h
+        os.utime(p, (old, old))
+        with open(os.path.join(out,
+                               os.path.splitext(name)[0] + '（弹幕版）.mp4'),
+                  'w') as f:
+            f.write('y')                  # 弹幕版只在本地，云端没有
+        return p
+
+    def test_cleanable_when_cloud_query_unavailable(self):
+        """★核心：云端查不到（None）也不该挡住"本地有成品"的判定。"""
+        self.m.cloud_files = lambda task: None
+        name = '甲-2026年11月08日18点18分.ts'
+        p = self._make_old_source_with_render(name)
+        ok, _ = self.m.find_candidates()
+        self.assertIn(p, [x[0] for x in ok],
+                      '命中跳过上传的分段被云端校验挡住 —— 源视频会永久滞留')
+
+    def test_cleanable_when_cloud_is_empty(self):
+        """云端空集合（规则生效、故意没传）同样应放行。"""
+        self.m.cloud_files = lambda task: set()
+        name = '甲-2026年11月08日19点18分.ts'
+        p = self._make_old_source_with_render(name)
+        ok, _ = self.m.find_candidates()
+        self.assertIn(p, [x[0] for x in ok])
+
+    def test_default_min_age_is_24h(self):
+        """★后悔期对齐 clean_args（86400s）。改回 30 分钟会绕过保护窗口。"""
+        with open(MODULE_PATH, encoding='utf-8') as fh:
+            src = fh.read()
+        self.assertRegex(src, r'def find_candidates\(min_age_minutes=1440\)')
+        self.assertRegex(src, r"add_argument\('--min-age'.*default=1440")
+        self.assertIn('skip_upload_rule', src,
+                      '源码里丢了跳过上传机制的说明，判据容易被后人改错')
+
+    def test_recent_file_protected_by_default_age(self):
+        """2 小时前的文件（有成品、不在队列）默认也不许删。"""
+        self.m.cloud_files = lambda task: None
+        name = '甲-2026年11月09日08点00分.ts'
+        p = self._make_old_source_with_render(name)
+        recent = time.time() - 120 * 60
+        os.utime(p, (recent, recent))
+        ok, skipped = self.m.find_candidates()
+        self.assertNotIn(p, [x[0] for x in ok],
+                         '默认后悔期没生效 —— 刚渲染完的源视频会被提前删掉')
+        self.assertIn(p, [x[0] for x in skipped])
 
 
 if __name__ == '__main__':

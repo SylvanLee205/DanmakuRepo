@@ -10,7 +10,7 @@
 - 实盘规模：**43 个主播**同时监控（抖音为主），已连续运行数月
 - 一场直播全程无人工：开播自动录、下播自动渲染、自动上传、24 小时后自动删源
 - 崩溃能自愈：开机自启、跨会话迁移、优雅停止、启动对账、孤儿分段接管
-- 有 **562 个模块级测试**兜底
+- 有 **566 个模块级测试**兜底
 
 > **第一次用？就三步：**
 > 1. 双击 **`Setup.bat`** —— 装环境（Python 虚拟环境、依赖、ffmpeg、rclone）
@@ -57,7 +57,7 @@
 | `main.py` + `DMR/` | **全部运行时代码**（代码自带逻辑，看这里就够） | 🔴 |
 | `configs/` | 33 个任务配置 + `global.yml`（**不入 git**） | 🔴 运行时读 |
 | `tools/`（52 个） | 运维工具，按用途分组，索引在 `tools/README.md` | 🟡 遇到具体事时用 |
-| `unit_tests/` | 562 个单元测试，改代码后必跑 | 🟡 |
+| `unit_tests/` | 566 个单元测试，改代码后必跑 | 🟡 |
 | `docs/maintainer-log.md` | **完整历史 + 全部踩坑**（按时间，最新在末尾） | 🟡 改代码前翻 |
 | `docs/project_state.md` | 当前设计与取舍 | 🟡 |
 | `docs/archive/`（10 份） | **实测记录 / 事故复盘 / 规范**，有索引 `archive/README.md` | 🟢 需要考古时看 |
@@ -134,7 +134,7 @@ Restart_DMR.bat          一键重启（优雅停止 + 重新拉起 + 验证）
 Doctor.bat               一键体检
 _env.bat                 所有 bat 共用：解析 Python 解释器 + 补全 PATH
 tools/                   30+ 运维工具，默认预览、加 --apply 才动手
-unit_tests/              562 个模块级测试
+unit_tests/              566 个模块级测试
 configs/                 DMR-*.yml 任务配置；temp/ 是停用归档区
 logs/                    DMR-*.log 日志 + dmr_state.db 状态库
 直播回放/<主播>/          源视频；<主播>（弹幕版）/ 是成品
@@ -462,7 +462,7 @@ warning，**绝不影响录制**。配置在 `global.yml` 的 `maintenance:` 段
 python -B -m unittest discover -s unit_tests -t .
 ```
 
-**562 个测试，全绿（5 个 expected failure）。**
+**566 个测试，全绿（5 个 expected failure）。**
 
 > 旧版本在找不到 ffmpeg 时会 `input()` 等你回车，无控制台环境下表现为卡死。
 > 2026-11-02 起 `toolsmgr` 里**已无任何 `input()`**：找不到就打印指引 +
@@ -517,7 +517,7 @@ SmallPeaches/DanmakuRender v5（架构来源：引擎/消息/插件/配置合并
         ├─ 上传层重建：B站（biliup） → rclone + 网盘
         ├─ 新增：SQLite 状态库、启动对账、延迟清理
         ├─ 新增：三层自启、优雅停止、孤儿接管、30+ 运维工具
-        ├─ 新增：562 个模块级测试
+        ├─ 新增：566 个模块级测试
         └─ 改名：DanmakuRender-AutoUp → DanmakuRepo
 ```
 
