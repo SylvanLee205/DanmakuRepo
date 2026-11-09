@@ -158,7 +158,7 @@ main.py
 | 同一条断言再次出现 | **不要认定是同一个原因**：用分层验证（`-f null` → libx265 → hevc_qsv）区分字幕层/软件编码/硬件编码 |
 | 某主播一直重试渲染 | 只清 `failed_renders.json` 不够，reconciler 会补派目录里的孤儿源视频 —— 必须把源视频移出目录 |
 | 停用主播后崩溃循环刷日志 | 状态库里还有该任务会话 → `_check_task_set_consistency` 拒绝启动。正确姿势：配置挪进 `configs/temp/` **且** 跑 `tools/purge_task_state.py --apply` |
-| `push_all.py` 说"公开=nochange" | 先别当漏推：`master` 与 `main` 是两条独立历史、hash 必然不同，nochange 只表示公开 worktree 的树与 master 无差异。核对用 `git ls-remote origin refs/heads/main` 比提交标题，再看公开 worktree `git status -sb` |
+| `push_all.py --apply` 打印「公开=nochange」**但其实推了** | 11-09 实踩：输出 nochange 之后，公开 worktree 与 `origin/main` 都出现了新提交（`a898d2b`，标题 = master 最新提交，diff 就是那 5 个 md）。**别只看脚本输出**，用 `git ls-remote origin refs/heads/main` 比 hash、用 `git -C <项目>-prodsync log -1 --format=%s` 比标题确认。成因未查清（疑似 apply 分支的返回值/统计顺序），内容正确性没问题；另注意重复跑 `--apply` 会额外生成一条私有快照提交（状态库每次都在变），无害但没必要 |
 | **`push_all.py` 说"工作区有未提交改动"但 `git diff` 是空的** | 全是**未跟踪**的垃圾文件（`.DS_Store` 等）。`master_dirty()` 只看 `git status --porcelain` 有没有输出，`??` 也算脏。`git diff` 看不到未跟踪文件，所以极易误判。用 `git status --porcelain` 看 `??` 那几行 |
 | `.DS_Store` 越清越多、清不完 | 从 Mac / Finder 浏览这个 SMB 共享**必然**在 Windows 盘生成。只能靠 `.gitignore` 挡住（已加 `.DS_Store` / `._*` / `Thumbs.db` / `desktop.ini`），不要指望手动删干净 |
 | 心跳日志里的主播数跟 `configs/` 实际数量对不上 | `main.py` 心跳曾用启动时快照 `n_tasks`，热加载增删主播后不刷新（实测写 33、实际 35）。已改成每次现取 `dmr.engine.task_dict` |
