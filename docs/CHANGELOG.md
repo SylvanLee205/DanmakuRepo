@@ -196,6 +196,9 @@ python -B -m unittest discover -s unit_tests -t .
   `main` 才是任何人/AI 打开仓库时的默认落点。
 - `v5` 保留不动：它是 fork 锚点，删了只会失去"上游原样长什么样"的参照。
 - 打 **tag `v6.0.0`**：标记"改名 + 文档重构 + 目录改名"这一版。
+  ⚠️ **该 tag 已作废**：它误打在 `master` 上，源码包里完全没有
+  `configs/global.example.yml` 等示例配置，下载下来不知道怎么配。
+  请改用 **v6.1.0**（tag 打在 `main`），见 `docs/RELEASE-v6.1.0.md`。
 
 ### 推送方式
 

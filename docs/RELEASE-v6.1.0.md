@@ -143,6 +143,8 @@
    `python tools/purge_task_state.py --apply`。只挪配置会崩溃循环
    （状态库里还有该任务的会话 → 启动一致性检查拒绝启动）。
 5. Server酱 旧 key 重置（见上文「安全」）。
+6. **别用 v6.0.0**。那个 tag 误打在 `master`（源码包缺示例配置），已作废；
+   从 v6.1.0 起发行 tag 一律打 `main`。
 
 ## 已知问题
 
