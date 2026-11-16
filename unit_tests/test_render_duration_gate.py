@@ -272,5 +272,32 @@ class TestFailedRenderDedup(DMRTestCase):
         render.render_executors.shutdown(wait=False)
 
 
+    def test_load_reports_that_list_is_not_a_retry_queue(self) -> None:
+        """日志必须写明"不会自动重跑"——否则读起来像个待办队列。
+
+        背景（2026-11-16）：生产日志每次重启都打印
+        ``Loaded 5 failed render tasks.``，之后毫无动作。原因是这句日志
+        把"展示清单"说成了"待重试队列"，真正的补派在状态库对账那边。
+        """
+        self._write({'a': self._entry(self.src)})
+        with self.assertLogs('DMR.Render', level='INFO') as ctx:
+            render = Render(pipe=(None, None))
+        render.render_executors.shutdown(wait=False)
+
+        text = '\n'.join(ctx.output)
+        self.assertIn('Loaded 1 failed render tasks', text)
+        self.assertIn('不会自动重跑', text, '必须明说启动时不重跑')
+        self.assertIn('状态库对账', text, '必须指明谁负责补派')
+
+    def test_empty_list_reports_zero(self) -> None:
+        """空清单也要说一句，别让人以为"没日志=没检查"。"""
+        self._write({})
+        with self.assertLogs('DMR.Render', level='INFO') as ctx:
+            render = Render(pipe=(None, None))
+        render.render_executors.shutdown(wait=False)
+        self.assertIn('Loaded 0 failed render tasks.',
+                      '\n'.join(ctx.output))
+
+
 if __name__ == '__main__':
     unittest.main()

@@ -140,7 +140,7 @@ class Render():
                         self.logger.info(f'清理 {stale} 条过期失败记录'
                                          f'（产物已完整落盘，属补派成功后的残留）。')
                     self.save_failed_tasks()
-                self.logger.info(f'Loaded {len(self.failed_tasks)} failed render tasks.')
+                self._log_disposition()
             except Exception as e:
                 # ⚠️ 2026-11-02：加载失败必须把坏文件挪走。
                 #    否则每次启动都报同一句错，而这份"待重试清单"实际上
@@ -153,6 +153,41 @@ class Render():
                     self.logger.error(f'损坏的待重试清单已另存为 {bad}（内容需人工检查）')
                 except OSError:
                     pass
+
+    def _log_disposition(self):
+        """把 "Loaded N failed render tasks." 这句话说完整。
+
+        为什么（2026-11-16，用户提问引出）：原日志只有一句
+        "Loaded 5 failed render tasks."，读起来像"启动时会把它们重跑一遍"，
+        实际上下面的代码**不会**做任何事 —— 这份清单只是 Web 界面
+        「失败渲染」列表的数据源，外加一个人工重试按钮。真正的补派由状态库
+        对账负责（``DMR/state/reconciler.py:_dispatch_pending_renders``），
+        而它只遍历状态库里的产物。
+
+        于是出现口径分裂：清单里的条目如果**没有状态库记录**（例如 11-04
+        ~11-15 状态库冻结期间产生的，或者录播目录/库被重置过），那就两个
+        机制都不会碰它 —— 每次启动都打印同一句"加载了 N 条"，永远不动作，
+        也永远不消失。这句日志现在把"不会自动重试 + 谁来负责"写明，免得
+        把它当成待办队列。
+        """
+        n = len(self.failed_tasks)
+        if n <= 0:
+            self.logger.info('Loaded 0 failed render tasks.')
+            return
+        self.logger.info(
+            f'Loaded {n} failed render tasks'
+            f'（仅用于 Web 界面展示与人工重试，启动时不会自动重跑；'
+            f'分段的自动补派由状态库对账负责）。')
+        for task in self.failed_tasks.values():
+            video = task.get('video')
+            path = video.get('path') if isinstance(video, dict) \
+                else getattr(video, 'path', None)
+            if not path:
+                continue
+            has_out = bool(task.get('output')) and os.path.exists(str(task['output']))
+            self.logger.debug(
+                f'  待重试记录: {basename(str(path))}'
+                f'（产物{"已存在" if has_out else "缺失"}）')
 
     def save_failed_tasks(self):
         """原子写入：先写临时文件再 replace，避免写一半崩溃留下半个 JSON。
