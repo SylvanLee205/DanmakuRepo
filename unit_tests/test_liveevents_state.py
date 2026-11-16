@@ -585,6 +585,107 @@ class TestSettleExistingProduct(_SyncTestCase):
         self.assertEqual(self.artifact("g1", ArtifactKind.SOURCE, 1).state,
                          ArtifactState.UPLOADED)
 
+    # ── 2026-11-16 第二轮复审：settle 的三处新问题 ──────────────────────
+
+    def _events_upload(self, *, journal=None):
+        """带 auto_upload 的实例 —— 正是当初被测试集体绕开的那条分支。"""
+        events = self.make_events(
+            common_event_args={"auto_render": True, "auto_upload": True,
+                               "auto_clean": False, "auto_transcode": False},
+            render_args={"dmrender": {"output_dir": self.tmpdir, "format": "mp4"}},
+            upload_args={"dm_video": [{"engine": "biliwebapi", "realtime": True,
+                                       "target": "bilibili", "account": "a",
+                                       "min_length": 0}]},
+        )
+        events.state_repo = self.repo
+        events._pending_clean_path = self.path("pending_clean.json")
+        if journal is not None:
+            import json as _json
+            with open(events._pending_clean_path, "w", encoding="utf-8") as f:
+                _json.dump(journal, f, ensure_ascii=False)
+        return events
+
+    def _blank_group(self, video):
+        return [{
+            "src_video": {"status": "ready", "file": video, "wait": [], "segment_id": 1},
+            "src_video_pre": {"status": None, "file": None, "wait": [],
+                              "segment_id": None},
+            "dm_video": {"status": None, "file": None, "wait": [], "segment_id": None},
+        }]
+
+    def test_settled_slot_is_videoinfo_not_str(self):
+        """★N-1：settle 写回槽位的必须是 VideoInfo，不能是路径字符串。
+
+        原来写 str，同一轮的 ``_check_for_upload`` 会拿它去
+        ``_passes_length_gate``，那里访问 ``video.path`` → AttributeError，
+        异常被启动恢复循环吞掉 → **该任务整轮恢复中止**。
+        """
+        src = self.path("主播-2026年11月15日19点18分.ts")
+        open(src, "wb").close()
+        product = self.path("主播-2026年11月15日19点18分（弹幕版）.mp4")
+        with open(product, "wb") as f:
+            f.write(b"\0" * 2048)
+        events = self._events_upload(journal=[])          # 无上传证据 → ready
+        video = self.make_video(src, segment_id=1, group_id="g1")
+        events.state_dict["g1"] = self._blank_group(video)
+
+        events._settle_existing_product("g1", "dm_video", 0, product,
+                                        source_video=video)
+
+        slot = events.state_dict["g1"][0]["dm_video"]
+        self.assertFalse(isinstance(slot["file"], str),
+                         "槽位里塞字符串会让上传闸门 AttributeError")
+        self.assertEqual(getattr(slot["file"], "path", None), product)
+        self.assertEqual(slot["status"], "ready")
+
+        # 真正的回归断言：走一遍上传检查，不许抛异常（闸门会因缺 moov 拒传）
+        events._check_for_upload("g1")
+
+    def test_skipped_artifact_is_not_faked_as_uploaded(self):
+        """★N-7：库里是 SKIPPED（按规则跳过、从未上传）时不得标 uploaded。
+
+        待删清单里既有"上传确认后排队"，也有"命中跳过规则、源照删成品留本地"。
+        只凭文件名命中就判已上传，会让状态库永久显示假"已上传"，
+        以后关掉跳过规则也不会补传。
+        """
+        src = self.path("主播-2026年11月15日20点18分.ts")
+        open(src, "wb").close()
+        product = self.path("主播-2026年11月15日20点18分（弹幕版）.mp4")
+        open(product, "wb").close()
+        key = make_artifact_key("g1", ArtifactKind.DANMAKU_VIDEO, 1)
+        self.repo.create_session("g1", "test")   # 产物有外键，必须先有场次
+        self.repo.upsert_artifact(key, "g1", 1, ArtifactKind.DANMAKU_VIDEO,
+                                  ArtifactState.SKIPPED, path=product,
+                                  last_error="skip_upload_rule: 横屏")
+        events = self._events(journal=self._journal(os.path.basename(src)))
+        video = self.make_video(src, segment_id=1, group_id="g1")
+        events.state_dict["g1"] = self._blank_group(video)
+
+        events._settle_existing_product("g1", "dm_video", 0, product,
+                                        source_video=video)
+
+        self.assertEqual(self.repo.get_artifact(key).state, ArtifactState.SKIPPED)
+        self.assertEqual(events.state_dict["g1"][0]["dm_video"]["status"],
+                         "upload_skipped")
+
+    def test_product_ok_fails_open_when_probe_unavailable(self):
+        """★N-2：ffprobe 不可用（没装/超时）绝不能判成品坏 —— 判坏会删文件。"""
+        from unittest import mock
+
+        events = self._events(journal=[])
+        product = self.path("主播-2026年11月15日21点18分（弹幕版）.mp4")
+        open(product, "wb").close()
+        video = self.make_video(product)
+
+        with mock.patch("DMR.Task.liveevents.FFprobe.probe_status",
+                        return_value=("unavailable", "找不到 ffprobe")):
+            self.assertTrue(events._dm_product_ok(video), "探测不可用必须放行")
+
+        with mock.patch("DMR.Task.liveevents.FFprobe.probe_status",
+                        return_value=("unreadable", "moov atom not found")):
+            self.assertFalse(events._dm_product_ok(video),
+                             "ffprobe 明确读不了才判坏")
+
 
 if __name__ == "__main__":
     unittest.main()

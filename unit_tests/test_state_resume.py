@@ -784,14 +784,21 @@ class TestUnusableFile(_StateCase):
 
         self.assertEqual(messages, [], "过小的文件不应被上传")
 
-    def test_too_small_is_marked_skipped(self):
+    def test_too_small_is_marked_failed(self):
+        """文件太小 → FAILED（不是 SKIPPED）。
+
+        ⚠️ 2026-11-16 第二轮复审 N-6：原来这里写 SKIPPED。而清理闸门把
+        "SKIPPED + 原因含『低于/阈值』"当成"按规则跳过上传、源可删" ——
+        于是一个残缺的小成品就能让唯一完好源被删掉。FAILED 同为终态、
+        同样不自动重试，但不在清理白名单里，语义也对：这是失败。
+        """
         artifact = self.seed()
         events = self.make_events()
 
         events.resume_recovered(self.actions(artifact))
 
         stored = self.repo.get_artifact(artifact.artifact_id)
-        self.assertEqual(stored.state, ArtifactState.SKIPPED)
+        self.assertEqual(stored.state, ArtifactState.FAILED)
         self.assertIn("阈值", stored.last_error or "")
         self.assertTrue(os.path.exists(artifact.path), "skip 不删除文件")
 
@@ -828,8 +835,9 @@ class TestUnusableFile(_StateCase):
         self.upload_events(on_unusable_file="discard").resume_recovered(
             self.actions(artifact))
 
+        # 同上：不可用产物落 FAILED，不落 SKIPPED
         self.assertEqual(self.repo.get_artifact(artifact.artifact_id).state,
-                         ArtifactState.SKIPPED)
+                         ArtifactState.FAILED)
         self.assertFalse(os.path.exists(artifact.path), "discard 应删除文件")
 
     def test_ask_keeps_state_for_manual_decision(self):
@@ -849,7 +857,7 @@ class TestUnusableFile(_StateCase):
             self.actions(artifact))
 
         self.assertEqual(self.repo.get_artifact(artifact.artifact_id).state,
-                         ArtifactState.SKIPPED)
+                         ArtifactState.FAILED)
 
     def test_custom_threshold_is_respected(self):
         artifact = self.seed(size_mb=10)

@@ -192,8 +192,104 @@ def ps(cmd: str) -> str:
     return ''
 
 
+def _proj_norm() -> str:
+    """项目根目录的归一化形式（比较用）。"""
+    return os.path.normcase(os.path.abspath(UP))
+
+
+def _is_our_process(proc, proj: str) -> bool:
+    """:func:`_dmr_pids_psutil` 的归属判据（任一命中即认）。"""
+    try:
+        exe = os.path.normcase(os.path.abspath(proc.info.get('exe') or ''))
+        if exe and exe.startswith(proj + os.sep):
+            return True
+    except Exception:                                            # noqa: BLE001
+        pass
+    try:
+        cwd = os.path.normcase(os.path.abspath(proc.cwd() or ''))
+        if cwd and cwd == proj:
+            return True
+    except Exception:                                            # noqa: BLE001
+        pass
+    try:
+        cmd = ' '.join(proc.info.get('cmdline') or [])
+        if proj in os.path.normcase(cmd) or os.path.basename(proj) in cmd:
+            return True
+    except Exception:                                            # noqa: BLE001
+        pass
+    try:
+        parent = proc.parent()
+        for _ in range(4):          # 启动器 → 真身，最多往上找 4 层
+            if parent is None:
+                break
+            try:
+                pexe = os.path.normcase(os.path.abspath(parent.exe() or ''))
+            except Exception:                                    # noqa: BLE001
+                pexe = ''
+            pcmd = ''
+            try:
+                pcmd = os.path.normcase(' '.join(parent.cmdline() or []))
+            except Exception:                                    # noqa: BLE001
+                pass
+            if (pexe and pexe.startswith(proj + os.sep)) or proj in pcmd:
+                return True
+            parent = parent.parent()
+    except Exception:                                            # noqa: BLE001
+        pass
+    return False
+
+
+def _dmr_pids_psutil() -> list:
+    """用 psutil 找本项目自己的 DMR 主进程，返回 [(pid, session_id)]。
+
+    ⚠️ 2026-11-16 第二轮复审 N-8：原来唯一的判据是"命令行含项目名"，但
+    ``.venv/Scripts/python.exe`` 只是**启动器** —— 真正的解释器是
+    ``C:\\Python311\\python.exe``，它的命令行里**没有项目名**
+    （生产实测：2388 = ``C:\\Python311\\python.exe main.py --quiet``，7940 =
+    启动器）。启动器一退出（或换一种启动方式），旧判据就得到"DMR 没在跑"
+    → 守护反复拉起 → 新实例撞 Global 互斥体 exit 3 → 10 秒后再拉，
+    变成启动循环 + 崩溃计数误报。
+
+    判据改为"任一命中"（任一成立就算本项目）：
+      · 可执行文件在项目目录下（.venv 启动器）
+      · 工作目录 == 项目根（真身的典型特征）
+      · 父进程链上有本项目进程（真身是启动器的子进程）
+      · 命令行含项目路径/项目名（旧判据，兜底）
+    """
+    out = []
+    proj = _proj_norm()
+    try:
+        import psutil
+    except ImportError:
+        return out
+    for proc in psutil.process_iter(['pid', 'name', 'cmdline', 'exe']):
+        try:
+            if (proc.info.get('name') or '').lower() != 'python.exe':
+                continue
+            cmd = [a for a in (proc.info.get('cmdline') or []) if a]
+            if not any(os.path.basename(a).lower() == 'main.py' for a in cmd):
+                continue
+            if _is_our_process(proc, proj):
+                out.append((proc.info['pid'], _session_id(proc.info['pid'])))
+        except Exception:                                        # noqa: BLE001
+            continue
+    return out
+
+
 def dmr_processes() -> list:
-    """返回 [(pid, session_id), ...]；没有则空列表。"""
+    """返回 [(pid, session_id), ...]；没有则空列表。
+
+    优先用 psutil（能拿到 exe / cwd / 父进程，见 :func:`_dmr_pids_psutil`），
+    psutil 不可用时才退回 ``DMR_Q`` 的命令行匹配（弱一些，但聊胜于无）。
+    """
+    try:
+        import psutil  # noqa: F401
+    except ImportError:
+        procs = None
+    else:
+        procs = _dmr_pids_psutil()
+    if procs is not None:
+        return procs
     out = ps(DMR_Q).replace('\r', ' ').replace('\n', ' ')
     procs = []
     for tok in out.split():

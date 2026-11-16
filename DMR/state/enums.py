@@ -23,7 +23,20 @@ __all__ = [
     "StateConsistencyError",
     "coerce_artifact_state",
     "coerce_upload_group_state",
+    "SKIP_RULE_MARK",
 ]
+
+#: 「命中跳过上传规则」在 ``last_error`` 里的专用前缀。
+#:
+#: 为什么要有专用标记（2026-11-16 第二轮复审 N-6）：
+#: 清理闸门要判断"这段源视频是不是按规则跳过上传、可以安全删除"。原来靠
+#: 关键词匹配（'低于' / '阈值' / '时长' …），而 ``_handle_unusable`` 给
+#: "文件太小/大小未知"写的 SKIPPED 原因里**恰好也有这些词** —— 于是
+#: 一个残缺的小成品就能让闸门认定"源已处理完"，删掉唯一完好副本。
+#: 反过来，真正按规则跳过的行当时**根本没写原因**（last_error=None），
+#: 于是"该清的永远清不掉"。两个方向都是错的。
+#: 现在：按规则跳过只认这个前缀；其它来路的 SKIPPED 一律不参与删除判定。
+SKIP_RULE_MARK = 'skip_upload_rule'
 
 
 class StateConsistencyError(RuntimeError):

@@ -146,9 +146,26 @@ def render_final_name(template, streamer, dt):
 
 
 def _token14_of(name):
-    """从文件名里取出第一个 14 位时间戳（YYYYMMDDHHMMSS），拿不到返回 None。"""
+    """从文件名里取出第一个 14 位时间戳（YYYYMMDDHHMMSS），拿不到返回 None。
+
+    ⚠️ 2026-11-16 第二轮复审 N-4：上一版写的是 ``re.findall(r'\\d{14}', name)``，
+    要求 **14 位数字连续**。可实际命名是 ``YYYYMMDD-HHMMSS``（**带连字符**，
+    本文件自己的分段正则就是 ``\\d{8}-\\d{6}``）：::
+
+        _token14_of('[正在录制]主播-20261018-231500-Part000.ass') -> None
+
+    于是所有候选都被跳过、``find_danmaku`` 恒返回 None，孤儿分段恢复时
+    永远"没找到配对弹幕"→ 渲染必失败。旧实现（剥掉非数字再匹配）反而能用，
+    这次"修复"的方向恰好打反了。
+
+    现在先把非数字全部剥掉，再在数字串上滑动取 14 位 —— 既支持带连字符的
+    真实命名，也兼容历史上的连续 14 位写法；文件名前后混入的其它数字
+    （主播名里的编号、Part 序号）由滑动窗口+日期合法性校验自然排除。
+    """
     try:
-        for run in re.findall(r'\d{14}', name):
+        digits = re.sub(r'\D', '', name or '')
+        for i in range(max(0, len(digits) - 13)):
+            run = digits[i:i + 14]
             try:
                 return datetime.strptime(run, '%Y%m%d%H%M%S')
             except ValueError:

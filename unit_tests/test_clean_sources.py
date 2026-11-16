@@ -201,6 +201,10 @@ class TestPendingCleanGuard(unittest.TestCase):
         self.m.ROOT = self.tmp
         self.m.REPLAY = os.path.join(self.tmp, '直播回放')
         os.makedirs(os.path.join(self.tmp, 'logs'), exist_ok=True)
+        # 这里造的是 1 字节的假成品：_product_ok 会（正确地）判它不能播。
+        # 本组测试验证的是"状态库 + 队列"判据，完整性另有专门用例，
+        # 所以把可播性检查短路掉。
+        self.m._product_ok = lambda path: True
 
     def tearDown(self):
         self.m.ROOT, self.m.REPLAY = self._orig_root, self._orig_replay
@@ -324,6 +328,10 @@ class TestSkipUploadSemantics(unittest.TestCase):
         self.m.ROOT = self.tmp
         self.m.REPLAY = os.path.join(self.tmp, '直播回放')
         os.makedirs(os.path.join(self.tmp, 'logs'), exist_ok=True)
+        # 这里造的是 1 字节的假成品：_product_ok 会（正确地）判它不能播。
+        # 本组测试验证的是"状态库 + 队列"判据，完整性另有专门用例，
+        # 所以把可播性检查短路掉。
+        self.m._product_ok = lambda path: True
         # 队列为空：模拟"跳过上传 → 没进队列"的历史遗留
         with open(os.path.join(self.tmp, 'logs', 'pending_clean.json'),
                   'w', encoding='utf-8') as f:
@@ -335,7 +343,7 @@ class TestSkipUploadSemantics(unittest.TestCase):
         self.m.cloud_files = self._orig_cloud
 
     def _make_old_source_with_render(self, name, state='skipped',
-                                     reason='命中跳过上传规则：横屏 + 码率 3000kbps'):
+                                     reason='skip_upload_rule: 横屏 + 码率 3000kbps'):
         src = os.path.join(self.m.REPLAY, '原视频', '甲')
         out = os.path.join(self.m.REPLAY, '弹幕版', '甲')
         os.makedirs(src, exist_ok=True)
@@ -370,6 +378,33 @@ class TestSkipUploadSemantics(unittest.TestCase):
         """云端空集合（规则生效、故意没传）同样应放行。"""
         self.m.cloud_files = lambda task: set()
         name = '甲-2026年11月08日19点18分.ts'
+        p = self._make_old_source_with_render(name)
+        ok, _ = self.m.find_candidates()
+        self.assertIn(p, [x[0] for x in ok])
+
+    def test_keyword_lookalike_reason_is_not_rule_skipped(self):
+        """★2026-11-16 复审 N-6 假阳性：别的原因文本里带"低于/阈值"也不算规则跳过。
+
+        真实数据：状态库里有一批 `skipped + '文件仅 15.6MB，低于 30MB 阈值'`，
+        那是 `_handle_unusable` 给"文件太小"写的，产物可能根本播不了。
+        旧实现用关键词白名单（'低于'/'阈值'/'时长'）判"按规则跳过"，于是这种
+        分段也会被放行删源 —— 删掉的可能是唯一完好副本。
+        """
+        self.m._product_ok = lambda path: True
+        self.m.cloud_files = lambda task: set()
+        name = '甲-2026年11月08日20点18分.ts'
+        p = self._make_old_source_with_render(
+            name, reason='文件仅 15.6MB，低于 30MB 阈值')
+        ok, skipped = self.m.find_candidates()
+        self.assertNotIn(p, [x[0] for x in ok],
+                         '关键词撞白名单的 skipped 被误判成"按规则跳过"→ 会删掉源')
+        self.assertTrue(any(s[0] == p for s in skipped))
+
+    def test_rule_skipped_prefix_is_accepted(self):
+        """带专用前缀的 skipped 才允许删源。"""
+        self.m._product_ok = lambda path: True
+        self.m.cloud_files = lambda task: set()
+        name = '甲-2026年11月08日21点18分.ts'
         p = self._make_old_source_with_render(name)
         ok, _ = self.m.find_candidates()
         self.assertIn(p, [x[0] for x in ok])

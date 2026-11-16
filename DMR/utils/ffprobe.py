@@ -1,3 +1,4 @@
+import os
 import subprocess
 import json
 import warnings
@@ -35,7 +36,85 @@ class FFprobe():
         out = out.decode('utf8')
         res = json.loads(out)
         return res
-        
+
+    #: ``probe_status`` 的三种结论
+    PROBE_OK = 'ok'                   #: 解析成功，detail 是容器时长（秒）
+    PROBE_UNREADABLE = 'unreadable'   #: ffprobe 能跑，但确实读不了这个文件（缺 moov / 非媒体文件）
+    PROBE_UNAVAILABLE = 'unavailable'  #: 探测本身不成立（没装 ffprobe / 超时 / 权限），调用方必须 fail-open
+
+    @classmethod
+    def probe_status(cls, fpath, timeout: float = 60):
+        """三态探测：文件可读 / 文件读不了 / 探测本身不可用。
+
+        为什么必须区分（2026-11-16 第二轮复审 N-2）：
+            ``get_duration`` 与 ``get_media_duration`` 把所有异常都吞成 ``-1``，
+            调用方根本分不清"这台机器没装 ffprobe / 超时"和"这个 mp4 真的没有
+            moov"。而恢复流程的判断是「读不出时长 → 删掉重新渲染」——
+            在探测本身失效的那一天，它会**批量删掉好成品**。
+
+        判据来源可靠：ffprobe 正常跑起来但文件读不了时，退出码非 0 且 stderr
+        有具体信息（``moov atom not found`` / ``Invalid data found``）；
+        没装 / 超时 / 无权限则在启动子进程阶段就抛异常，两者不会混淆。
+
+        :returns: ``(status, detail)``
+            * ``('ok', 时长秒数)``
+            * ``('unreadable', 错误文本)``
+            * ``('unavailable', 原因)``
+        """
+        try:
+            exe = cls.ffprobe()
+        except Exception as e:                                   # noqa: BLE001
+            return cls.PROBE_UNAVAILABLE, f'找不到 ffprobe: {type(e).__name__}: {e}'
+        try:
+            proc = subprocess.run(
+                [exe, '-v', 'error',
+                 '-show_entries', 'format=duration',
+                 '-of', 'default=nw=1:nk=1', str(fpath)],
+                capture_output=True, text=True, timeout=timeout,
+                encoding='utf-8', errors='replace',
+            )
+        except FileNotFoundError as e:
+            return cls.PROBE_UNAVAILABLE, f'ffprobe 不存在: {e}'
+        except subprocess.TimeoutExpired:
+            return cls.PROBE_UNAVAILABLE, f'ffprobe 探测超时（{timeout}s）'
+        except OSError as e:
+            return cls.PROBE_UNAVAILABLE, f'ffprobe 无法启动: {type(e).__name__}: {e}'
+        except Exception as e:                                   # noqa: BLE001
+            return cls.PROBE_UNAVAILABLE, f'ffprobe 异常: {type(e).__name__}: {e}'
+
+        if proc.returncode != 0:
+            err = (proc.stderr or '').strip().replace('\n', ' ')[-300:]
+            return cls.PROBE_UNREADABLE, err or f'ffprobe 退出码 {proc.returncode}'
+        try:
+            return cls.PROBE_OK, float((proc.stdout or '').strip().splitlines()[0])
+        except (ValueError, IndexError):
+            err = (proc.stderr or '').strip().replace('\n', ' ')[-300:]
+            return cls.PROBE_UNREADABLE, err or 'ffprobe 未返回时长'
+
+    @classmethod
+    def is_playable(cls, path) -> bool:
+        """这个文件是否**像个能播的媒体**（0 字节 / 缺索引的半截 mp4 都算不能）。
+
+        用途：所有"看到成品就允许删源"的闸门（清理工具、磁盘紧急清理）
+        都必须先过这一关，否则一个 0 字节或被中途杀掉的成品就能让源视频
+        （唯一原始画质副本）被删掉。
+
+        探测工具不可用时返回 ``True``（放行）：环境问题不该被当成"文件坏了"，
+        否则 ffprobe 一缺，整个恢复/清理流程会集体误判。
+        """
+        try:
+            if not path or not os.path.exists(path):
+                return False
+            if os.path.getsize(path) <= 0:
+                return False
+        except OSError:
+            return False
+        if str(path).lower().endswith(('.mp4', '.mov', '.m4v')):
+            status, _detail = cls.probe_status(path)
+            if status == cls.PROBE_UNREADABLE:
+                return False
+        return True
+
     @classmethod
     def get_duration(cls,fpath) -> float:
         try:

@@ -68,7 +68,7 @@ class DanmakuRepo():
         为每个任务分配独立库文件，迁移配置目录或重命名任务都会静默丢失状态。
         代价是"同一状态库只能服务同一批任务"，由 :meth:`_init_state` 显式校验。
         """
-        state_args = self.config.get_config('state') or {}
+        state_args = self.config.get_config('state_args') or {}
         return str(state_args.get('db_path')
                    or os.path.join('logs', 'dmr_state.db'))
 
@@ -152,10 +152,26 @@ class DanmakuRepo():
         # 起因：临时测试任务验证完删掉配置后，库里残留的已完成记录
         # 让程序拒绝启动并进入 12 秒一次的崩溃循环，只能手动删库 ——
         # 那会连带把正常任务的历史一并丢掉，惩罚过重。
+        #
+        # ⚠️⚠️ 2026-11-16 事故后改为**显式开启**（默认 false）：
+        #   某次单元测试用了一份只含单个测试任务的配置去构造 DanmakuRepo，
+        #   于是"其它 22 个场次都是孤儿、产物全终态"，启动清理把它们**全部
+        #   删掉了**（10-15 ~ 11-03 的历史瞬间清零，事后只能从库快照合并回来）。
+        #   而"避免崩溃循环"这件事，下面的"隔离放行"已经做到了 ——
+        #   自动删历史并不是必需的，它的收益远小于误删的代价。
+        #   确需清理时：`tools/purge_task_state.py --apply`，
+        #   或在 global.yml 的 state_args 里设 purge_orphan_tasks: true。
+        _purge_orphans = bool((self.config.get_config('state_args') or {})
+                              .get('purge_orphan_tasks', False))
+        if not _purge_orphans:
+            self.logger.info(
+                f'状态库里有 {len(missing)} 个任务不在当前配置中，按"隔离保留"处理'
+                f'（不会自动删历史；确需清理用 tools/purge_task_state.py）：'
+                f'{sorted(missing)}')
         try:
             from .state.enums import TERMINAL_ARTIFACT_STATES
             purged = []
-            for _tn in sorted(missing):
+            for _tn in (sorted(missing) if _purge_orphans else []):
                 _sids = [s.session_id for s in self.state_repo.list_sessions()
                          if s.taskname == _tn]
                 _states = []
@@ -188,7 +204,7 @@ class DanmakuRepo():
         # tools/purge_task_state.py 两处调用），留着不会丢东西；把配置挪回
         # configs/ 就能继续用这些历史。确要认真时可打开 strict_consistency。
         from .state.enums import TERMINAL_ARTIFACT_STATES as _TERMINAL
-        strict = bool((self.config.get_config('state') or {})
+        strict = bool((self.config.get_config('state_args') or {})
                       .get('strict_consistency', False))
         if strict:
             raise StateConsistencyError(

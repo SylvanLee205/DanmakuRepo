@@ -33,6 +33,7 @@ import shutil
 import time
 
 from .paths import p, data_root, TEMP
+from .state.enums import SKIP_RULE_MARK
 from .paths import DANMAKU_SUBDIR, danmaku_dir_for, source_root
 
 __all__ = ('Maintenance', 'is_disk_emergency')
@@ -283,23 +284,31 @@ class Maintenance:
                        '  2) 或设 DMR_DATA_ROOT 指向更大的盘'])
 
     @staticmethod
-    def _has_danmaku(src_dir: str, dm_base: str) -> bool:
-        """源视频有没有对应的弹幕版产物（新/老两种布局都认）。
+    def _has_danmaku(src_dir: str, dm_base: str):
+        """源视频对应的弹幕版产物**路径**（新/老两种布局都认）；没有返回 None。
 
         ``dm_base`` 形如 ``xxx（弹幕版）``，命中判据是"前缀 + 扩展名"，
         不用 ``startswith(stem)`` —— 后者在 stem 很短时会误匹配到别的文件。
+
+        ⚠️ 2026-11-16 第二轮复审 N-6 假阳性：原来只判断"目录里有个同名文件"，
+        于是渲染被杀留下的 0 字节/缺索引半截文件也算"已渲染" → 磁盘告急时
+        删掉唯一完好源。现在返回路径，由调用方用 ``FFprobe.is_playable``
+        再确认一次。
         """
 
         def _in(d):
             try:
-                return any(n.startswith(dm_base) and n[len(dm_base):].startswith('.')
-                           for n in os.listdir(d))
+                for n in os.listdir(d):
+                    if n.startswith(dm_base) and n[len(dm_base):].startswith('.'):
+                        return os.path.join(d, n)
             except OSError:
-                return False
+                return None
+            return None
 
         # 新布局：直播回放/弹幕版/<主播>/
-        if _in(danmaku_dir_for(src_dir)):
-            return True
+        hit = _in(danmaku_dir_for(src_dir))
+        if hit:
+            return hit
         # 老布局（未迁移）：<主播>（弹幕版）/ 与 <主播>/ 平级，成品也可能就
         # 躺在源目录里（更早的版本确实是这样）
         return _in(src_dir)
@@ -369,14 +378,24 @@ class Maintenance:
                 if key:
                     src[key] = (sid, idx)
 
-        _skip_ok = ('跳过上传规则', '低于', '阈值', 'min_length', 'skip_upload',
-                    '过短', '时长')
+        # ⚠️ 2026-11-16 第二轮复审 N-6：原来这里是关键词白名单
+        #    ('跳过上传规则','低于','阈值','min_length','skip_upload','过短','时长')。
+        #    问题有两个方向：
+        #      · 假阳性：_handle_unusable 给"文件太小/大小未知"写的 SKIPPED 原因里
+        #        带 '低于 X MB 阈值' → 命中白名单 → 闸门认定"源已处理完"→
+        #        删掉唯一完好源（而那个小成品可能根本播不了）。
+        #      · 假阴性：真正按规则跳过的行当年**不写原因**（last_error=None）→
+        #        永远清不掉（生产库 d993c2b2 两条就是）。
+        #    现在只认专用前缀，其它来路的 SKIPPED 一律不参与删除判定。
+        _skip_ok = (SKIP_RULE_MARK,)
+        def _is_rule_skipped(reason: str) -> bool:
+            return str(reason or '').strip().lower().startswith(_skip_ok[0])
         out = {}
         for path, key in src.items():
             state, reason = dm.get(key, ('missing', ''))
             if state == 'uploaded':
                 out[path] = '已上传'
-            elif state == 'skipped' and any(k in reason for k in _skip_ok):
+            elif state == 'skipped' and _is_rule_skipped(reason):
                 out[path] = f'按规则跳过上传（{reason[:30]}）'
 
         # 24h 队列里的、上传重试失败的，一律不动
@@ -402,9 +421,27 @@ class Maintenance:
                 for task in (data.values() if isinstance(data, dict) else data):
                     if not isinstance(task, dict):
                         continue
-                    for key in ('video', 'src_video', 'file'):
-                        v = task.get(key)
-                        path = v.get('path') if isinstance(v, dict) else None
+                    # ⚠️ 2026-11-16 第二轮复审 D-9：上传失败任务的真实结构是
+                    # ``{'files': [VideoInfo, ...], ...}``，原来只找
+                    # ('video','src_video','file') 这三个键 → 永远空转。
+                    # 主闸门（状态库 uploaded 判定）仍然挡着，但"上传失败的任务
+                    # 一律不动"这层纵深防御等于不存在。现在把 files 列表也收进来。
+                    _cands = []
+                    for _k in ('video', 'src_video', 'file'):
+                        _v = task.get(_k)
+                        if isinstance(_v, dict):
+                            _cands.append(_v)
+                        elif isinstance(_v, str) and _v:
+                            _cands.append({'path': _v})
+                    _files = task.get('files')
+                    if isinstance(_files, list):
+                        for _f in _files:
+                            if isinstance(_f, dict):
+                                _cands.append(_f)
+                            elif isinstance(_f, str) and _f:
+                                _cands.append({'path': _f})
+                    for v in _cands:
+                        path = v.get('path')
                         if path:
                             protected.add(os.path.normcase(
                                 os.path.basename(str(path).replace('\\', '/'))))
@@ -469,7 +506,18 @@ class Maintenance:
                 # 后者在 stem 很短时会误匹配到别的文件。
                 stem, ext = os.path.splitext(name)
                 dm_base = f'{stem}{_DM_MARK}'
-                if not self._has_danmaku(dirpath, dm_base):
+                dm_path = self._has_danmaku(dirpath, dm_base)
+                if not dm_path:
+                    continue
+                # 成品必须真的能播，否则"已渲染"只是文件名巧合
+                try:
+                    from .utils import FFprobe
+                    _playable = FFprobe.is_playable(dm_path)
+                except Exception:                                # noqa: BLE001
+                    _playable = True
+                if not _playable:
+                    logger.warning(f'磁盘紧急清理：跳过 {name} —— 对应成品 '
+                                   f'{os.path.basename(dm_path)} 不完整，删源会丢唯一副本')
                     continue
                 path = os.path.join(dirpath, name)
                 try:

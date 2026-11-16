@@ -52,9 +52,22 @@ class Render():
         if not path:
             return ''
         try:
-            return os.path.normcase(os.path.abspath(str(path)))
+            key = os.path.normcase(os.path.abspath(str(path)))
         except OSError:
-            return str(path)
+            key = str(path)
+        # ⚠️ 2026-11-16 第二轮复审 A-3：原来只有源路径，于是
+        #    transcode（同源转码）与 dmrender（弹幕版）会互相顶掉 ——
+        #    后写的那条把前一条挤掉，另一份产物就再也没人重试了。
+        #    生产当前 auto_transcode 全 False，属潜伏；去重键带上**输出路径**
+        #    即可根治（两种模式的输出名天然不同），同一任务的重试仍只留一条。
+        #    不把 mode 放进键里：补派的任务对象可能没带 mode，
+        #    放进去会让"同一任务"误判成两条。
+        try:
+            out = task.get('output')
+            out_key = os.path.normcase(os.path.abspath(str(out))) if out else ''
+        except OSError:
+            out_key = str(task.get('output') or '')
+        return f'{key}|{out_key}'
 
     def _output_looks_complete(self, task, video) -> bool:
         """产物已存在且时长和源对得上 → 这条"失败"记录其实已经过期。

@@ -53,7 +53,7 @@ class _WiringTestCase(DMRTestCase):
                 "dmr_engine_args:\n"
                 f"  config_path: {config_path or config_dir}\n"
                 "  enabled_plugins: ['downloader']\n"
-                "state:\n"
+                "state_args:\n"
                 f"  db_path: {os.path.join(self.tmpdir, 'dmr_state.db')}\n"
                 f"  strict_consistency: {'true' if strict else 'false'}\n"
             )
@@ -74,7 +74,7 @@ class TestStateWiring(_WiringTestCase):
         from DMR import DanmakuRepo
 
         config = self.make_config()
-        config.global_config.pop("state", None)
+        config.global_config.pop("state_args", None)
 
         dmr = DanmakuRepo.__new__(DanmakuRepo)
         dmr.config = config
@@ -206,12 +206,14 @@ class TestTaskSetConsistency(_WiringTestCase):
         finally:
             conn.close()
 
-    def test_terminal_only_orphan_is_auto_purged(self):
-        """孤儿任务的产物全是终态时，自动清理并继续启动（不再崩溃循环）。
+    def test_terminal_only_orphan_is_isolated_not_deleted(self):
+        """孤儿任务的产物全是终态时：**隔离保留**，不删历史（2026-11-16 起）。
 
-        2026-10-19 实测事故：临时测试任务验证完删掉配置后，库里残留的已清理记录
-        让程序拒绝启动，进入 12 秒一次的崩溃循环，只能手动删整个 dmr_state.db
-        —— 会连带丢掉所有正常任务的历史。惩罚过重，改为自动清理。
+        老行为是自动 purge。2026-11-16 的教训：某次单元测试用一份只含单个
+        测试任务的配置构造 DanmakuRepo，于是"其它 22 个场次全是孤儿、产物全终态"，
+        启动清理把手写的历史全删了。而"避免崩溃循环"靠隔离放行就够了，
+        删历史不是必需的。确需清理请走 tools/purge_task_state.py --apply，
+        或在 state_args 里显式置 purge_orphan_tasks: true。
         """
         from DMR import DanmakuRepo
 
@@ -222,11 +224,30 @@ class TestTaskSetConsistency(_WiringTestCase):
         first.stop()
 
         other = self.make_config(taskname="other", subdir="configs_purge")
-        second = DanmakuRepo(other)             # 不应抛 StateConsistencyError
+        second = DanmakuRepo(other)             # 同样不应抛 StateConsistencyError
         try:
             self.assertIsNotNone(second.state_repo)
-            # 孤儿任务的历史已被清掉
-            self.assertIsNone(second.state_repo.get_session("sess-1"))
+            self.assertIsNotNone(second.state_repo.get_session("sess-1"),
+                                 "默认不应删除孤儿任务的历史")
+        finally:
+            second.stop()
+
+    def test_purge_orphans_can_be_opted_in(self):
+        """显式 purge_orphan_tasks: true 时才恢复"产终态即清理"的老行为。"""
+        from DMR import DanmakuRepo
+
+        config = self.make_config(taskname="test")
+        first = self.make_dmr(config)
+        first.state_repo.create_session("sess-1", "test")
+        self._add_artifact(first, 'cleaned')
+        first.stop()
+
+        other = self.make_config(taskname="other", subdir="configs_purge2")
+        other.global_config.setdefault('state_args', {})['purge_orphan_tasks'] = True
+        second = DanmakuRepo(other)
+        try:
+            self.assertIsNone(second.state_repo.get_session("sess-1"),
+                              "显式开启后应清理孤儿历史")
         finally:
             second.stop()
 
@@ -302,7 +323,7 @@ class TestStateRepoInjection(_WiringTestCase):
         sd.set_state_repo(None)
 
         config = self.make_config()
-        config.global_config['state'] = {'db_path': ':memory:'}
+        config.global_config['state_args'] = {'db_path': ':memory:'}
         dmr = DanmakuRepo(config)
         dmr.start()
         self.addCleanup(dmr.stop)
@@ -345,7 +366,7 @@ class TestResumePendingArtifacts(_WiringTestCase):
                 "dmr_engine_args:\n"
                 f"  config_path: {config_dir}\n"
                 "  enabled_plugins: ['downloader', 'uploader']\n"
-                f"state:\n  db_path: {os.path.join(self.tmpdir, 'dmr_state.db')}\n"
+                f"state_args:\n  db_path: {os.path.join(self.tmpdir, 'dmr_state.db')}\n"
             )
         return Config(global_file)
 

@@ -528,7 +528,10 @@ class DmRender(BaseRender):
 
                 # 先收集「廉价参考」：录制墙钟 / 容器跨度 / 弹幕最后时间戳。
                 # 产物只要不短于其中最大的那个的 98%，就不可能是被截断的，
-                # 直接放行，省掉扫包的开销（本机实测 4GB/1 小时 ts 约 1.2 秒）。
+                # 直接放行，省掉扫包的开销。
+                # ⚠️ 2026-11-16 复审更正：注释里原先写"4GB/1 小时 ts 约 1.2 秒"，
+                #    实测 **2.04GB ts 全量扫包 15.4 秒**（get_duration 仅 0.07s）。
+                #    所以下面这道廉价预判是必需的，不能省。
                 wall_dur = float(getattr(video, 'duration', 0) or 0)
                 fmt_dur = float(FFprobe.get_duration(video.path) or 0)
                 cands = []
@@ -544,20 +547,26 @@ class DmRender(BaseRender):
                 if cands and out_dur < max(c[0] for c in cands) * 0.98:
                     media_dur = float(FFprobe.get_media_duration(video.path) or -1)
                     # 合理性闸：包时长求和要求落在容器跨度的 30%~120%。
-                    # 落在区间外通常说明 duration_time 大面积缺失，此时
-                    # 宁可退回「弹幕时间戳 / 最小候选」，也不能拿一个偏小的
-                    # 数当基准（偏小会放过真正的截断）。
+                    # 落在区间外通常说明 duration_time 大面积缺失，这个数不能当基准。
                     if media_dur > 0 and (fmt_dur <= 0
                                           or 0.3 * fmt_dur <= media_dur <= 1.2 * fmt_dur):
                         src_dur, ref_src = media_dur, '源可解码媒体时长'
-                    elif dm_last_ts > 0:
-                        src_dur, ref_src = dm_last_ts, '弹幕最后时间戳'
                     else:
-                        src_dur, ref_src = min(c[0] for c in cands), min(cands)[1]
-                    if ref_src != '源可解码媒体时长':
+                        # ⚠️⚠️ 2026-11-16 第二轮复审 N-3 修：原来这里回退到
+                        #   「弹幕最后时间戳 / 最小候选」—— 两者都是**墙钟时间轴**
+                        #   （含起流等待、卡顿、重连空转），于是 A-1 那三起误删
+                        #   （产物 101%/100%/100% 却被判 86%/74%/83%）在
+                        #   "扫包失败"或"容器时长虚低（FLV 虚报 5.7 倍）"时
+                        #   原样复现：完整成品被 os.remove。
+                        #   现在改为 **fail-open**：拿不到可信的可解码时长，
+                        #   就没有证据说它残缺 → 保留产物、只记 warning。
+                        #   真截断仍由可信路径（media_dur 与容器跨度自洽）拦住；
+                        #   截断但探测失败的，宁可留下让人看，也不误删。
+                        src_dur, ref_src = 0.0, ''
                         self.logger.warning(
-                            f'无法精确测量源视频可解码时长，时长校验退回「{ref_src}」'
-                            f'（{src_dur:.0f} 秒），仍按 90% 阈值判定。')
+                            f'无法精确测量源视频可解码时长（扫包结果 {media_dur:.0f}s，'
+                            f'容器跨度 {fmt_dur:.0f}s），本次**跳过**时长校验、保留产物：'
+                            f'{output}')
 
                 if src_dur > 0 and out_dur > 0:
                     shortfall = src_dur - out_dur

@@ -103,7 +103,27 @@ def main():
              f" -and $_.CommandLine -like '*{_proj}*' }} | "
              "ForEach-Object { $_.ProcessId }")
     guards = [x for x in ps(CMD_Q).split() if x.isdigit()]
-    dmrs = [x for x in ps(DMR_Q).split() if x.isdigit()]
+    # ⚠️ 2026-11-16 第二轮复审 N-8：DMR 真身（C:\Python311\python.exe）的命令行里
+    # 没有项目名，按 DMR_Q 只能看到 venv 启动器；启动器一退出就误报"没起来"。
+    # 优先用 autostart_launch 里的归属感知查找（psutil：exe / cwd / 父进程链）。
+    dmr_procs = []          # [(pid, session)]
+    try:
+        import importlib.util
+        _spec = importlib.util.spec_from_file_location(
+            '_dmr_autostart_probe',
+            os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                         'autostart_launch.py'))
+        _mod = importlib.util.module_from_spec(_spec)
+        _spec.loader.exec_module(_mod)
+        dmr_procs = _mod.dmr_processes()
+    except Exception as e:                                       # noqa: BLE001
+        print(f'  （归属感知查找不可用，退回命令行匹配：{type(e).__name__}）')
+    dmr_sessions = None
+    if dmr_procs:
+        dmrs = [str(pid) for pid, _s in dmr_procs]
+        dmr_sessions = sorted({s for _p, s in dmr_procs if s is not None})
+    else:
+        dmrs = [x for x in ps(DMR_Q).split() if x.isdigit()]
     print(f'  守护 cmd : {guards or "❌ 不在"}')
     print(f'  DMR 进程 : {dmrs or "❌ 不在"}')
     if not dmrs:
@@ -123,11 +143,16 @@ def main():
         ctypes.windll.kernel32.ProcessIdToSessionId(os.getpid(),
                                                     ctypes.byref(sess))
         mine = sess.value
-        raw = ps("Get-CimInstance Win32_Process -Filter \"Name='python.exe'\" | "
-                 "Where-Object { $_.CommandLine -like '*main.py*' } | "
-                 "ForEach-Object { $_.SessionId } | Select-Object -Unique")
-        dmr_sess = sorted({x.strip() for x in (raw or '').split()
-                           if x.strip().isdigit()})
+        if dmr_sessions is not None:
+            # 已有归属感知的结果（psutil），不要再用 '*main.py*' 这种会命中
+            # 别的项目和 domain.py 的弱查询。
+            dmr_sess = dmr_sessions
+        else:
+            raw = ps("Get-CimInstance Win32_Process -Filter \"Name='python.exe'\" "
+                     "| Where-Object { $_.CommandLine -like '*main.py*' } | "
+                     "ForEach-Object { $_.SessionId } | Select-Object -Unique")
+            dmr_sess = sorted({x.strip() for x in (raw or '').split()
+                               if x.strip().isdigit()})
         print(f'  当前会话: {mine}    DMR 所在会话: {dmr_sess or "（没在跑）"}')
         if dmr_sess and str(mine) not in dmr_sess:
             print('  ⚠️ DMR 不在你当前会话 —— 控制台窗口看不到（录像不受影响）。')

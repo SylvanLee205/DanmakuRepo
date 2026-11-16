@@ -140,9 +140,14 @@ class TestDurationGate(unittest.TestCase):
     def test_temporary_ass_is_read_before_cleanup(self) -> None:
         """XML 弹幕场景：临时 .ass 在 finally 被删，时间戳必须提前读好。
 
-        旧实现在闸门里才读，此时文件已没了 → 返回 0 → 静默回退墙钟口径，
-        既可能误杀也可能放过。这里让产物(100s)明显短于弹幕(300s)，
-        只有"提前读到 300s"才会判失败。
+        旧实现在闸门里才读，此时文件已没了 → 返回 0 → 静默回退墙钟口径。
+
+        ⚠️ 2026-11-16 第二轮复审 N-3 改了结论：本用例原本断言"按弹幕最后
+        时间戳(300s)判定为截断 → 删产物"，而这正是 A-1 误删事故的复现路径 ——
+        墙面钟参考（含起流等待/卡顿/重连空转）比产物长得多，一扫包失败就拿它
+        判死。现在扫包不可用时一律 **fail-open**（保留产物、记 warning），
+        真实的截断由"可解码时长可信"的那条路径拦（见 test_real_truncation_is_rejected）。
+        本用例继续守住它最初的目的：临时 .ass 必须在渲染结束前被读走、并及时清理。
         """
         ass = os.path.join(self.tmp, 'temp_from_xml.ass')
         with open(ass, 'w', encoding='utf-8') as f:
@@ -165,7 +170,7 @@ class TestDurationGate(unittest.TestCase):
                                   return_value=(ass, ass)):
             status, _ = _make_render().render_one(video, self.out)
 
-        self.assertFalse(status, '应按弹幕最后时间戳(300s)判定为截断')
+        self.assertTrue(status, '扫包不可用时 fail-open：产物保留（复审 N-3）')
         self.assertFalse(os.path.exists(ass), '临时 ass 仍应被清理')
 
 

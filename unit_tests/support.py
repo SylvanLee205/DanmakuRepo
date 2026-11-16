@@ -131,6 +131,46 @@ class RecordingSubprocessRunner:
         return self.returncode
 
 
+def _forbid_production_state_db() -> None:
+    """硬闸门：单元测试绝不允许打开**生产**状态库 `logs/dmr_state.db`。
+
+    为什么必须加（2026-11-16 事故）：有个用例的全局配置把库路径写成了
+    ``state:`` 而不是代码实际读取的 ``state_args:``，于是 ``DanmakuRepo``
+    退回默认相对路径 ``logs/dmr_state.db`` —— 直接连上生产库。更糟的是
+    启动时的"孤儿任务清理"见到测试配置里只有一个 ``test`` 任务，就按
+    "用户换了配置目录"把 22 个历史场次当成孤儿**删掉了**（约 10-15 至 11-03
+    的全部历史）。事后只能从私有仓库的库快照里合并回来。
+
+    现在测试若再解析到那个路径，就直接抛异常：宁可测试红，也不能写生产库。
+    """
+    try:
+        from DMR.state.repository import StateRepository
+    except Exception:                                            # noqa: BLE001
+        return
+    if getattr(StateRepository, '_dmr_prod_guard', False):
+        return
+    prod = os.path.normcase(os.path.abspath(
+        os.path.join(_REPO_ROOT, 'logs', 'dmr_state.db')))
+    original_open = StateRepository.open
+
+    def guarded_open(self, *args, **kwargs):
+        try:
+            target = os.path.normcase(os.path.abspath(str(self.path)))
+        except Exception:                                        # noqa: BLE001
+            target = ''
+        if target == prod:
+            raise RuntimeError(
+                '单元测试试图打开生产状态库 logs/dmr_state.db —— 已拒绝。'
+                '请让用例使用临时目录里的库（state_args.db_path）。')
+        return original_open(self, *args, **kwargs)
+
+    StateRepository.open = guarded_open
+    StateRepository._dmr_prod_guard = True
+
+
+_forbid_production_state_db()
+
+
 class DMRTestCase(unittest.TestCase):
     """所有 DMR 用例的基类：统一提供时钟与常用构造工具。"""
 

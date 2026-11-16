@@ -156,8 +156,8 @@ def _scan_layouts():
     return pairs
 
 
-def _exists_rendered(stem, rendered_files):
-    """判断某个源分段是否有对应成品，容忍 ``(n)`` 重名后缀。
+def _rendered_match(stem, rendered_files):
+    """找出与源分段对应的成品**文件名**，容忍 ``(n)`` 重名后缀；没有返回 None。
 
     为什么不能只做一次精确匹配：
     同名的分段重录时，DMR 会把产物命名成 ``xxx(2)（弹幕版）.mp4``。原实现
@@ -166,18 +166,55 @@ def _exists_rendered(stem, rendered_files):
     （实测 755MB 躺了一周）。
     """
     for suffix in ('', ) + tuple(f'({i})' for i in range(1, 10)):
-        if f'{stem}{suffix}{RENDERED_DIR_SUFFIX}.mp4' in rendered_files:
-            return True
+        name = f'{stem}{suffix}{RENDERED_DIR_SUFFIX}.mp4'
+        if name in rendered_files:
+            return name
     # 兜底：成品名以「源名 + 可选(n)」开头即算命中，防止 DMR 用了别的后缀
     for name in rendered_files:
         if not name.endswith(RENDERED_DIR_SUFFIX + '.mp4'):
             continue
         base = name[:-len(RENDERED_DIR_SUFFIX + '.mp4')]
         if base == stem:
-            return True
+            return name
         if base.startswith(stem) and re.fullmatch(r'\(\d+\)', base[len(stem):]):
-            return True
-    return False
+            return name
+    return None
+
+
+def _exists_rendered(stem, rendered_files):
+    """是否有对应成品（只看文件名，不看完整性）。"""
+    return _rendered_match(stem, rendered_files) is not None
+
+
+#: 成品完整性检查的结论缓存（同一路径只探一次）
+_PRODUCT_OK_CACHE = {}
+
+
+def _product_ok(path):
+    """成品是否**真的能播**（不是 0 字节、不是缺 moov 的半截文件）。
+
+    ⚠️ 2026-11-16 第二轮复审 N-6 假阳性：原来只看"成品目录里有个同名 mp4"，
+    于是渲染被杀留下的半截文件也算"已渲染" —— 加上"按规则跳过上传"这个
+    状态（本就可达），--apply 就会删掉唯一完好源，留下一个播不了的成品。
+    现在额外验证：大小 > 0，且 ffprobe 能解析出容器时长（探测工具不可用时
+    放行 —— 环境问题不该阻断清理，但会打印提示）。
+    """
+    key = str(path)
+    if key in _PRODUCT_OK_CACHE:
+        return _PRODUCT_OK_CACHE[key]
+    try:
+        from DMR.utils import FFprobe
+        verdict = bool(FFprobe.is_playable(path))
+    except Exception:                                            # noqa: BLE001
+        # 拿不到探测能力就只做最保守的判断（非 0 字节）
+        try:
+            verdict = os.path.exists(path) and os.path.getsize(path) > 0
+        except OSError:
+            verdict = False
+    if not verdict:
+        print(f'  ⚠️ 成品不完整（0 字节 / 无法解析），不删源: {os.path.basename(str(path))}')
+    _PRODUCT_OK_CACHE[key] = verdict
+    return verdict
 
 
 def _exists_in_cloud(stem, cloud_set):
@@ -214,10 +251,21 @@ def _exists_in_cloud(stem, cloud_set):
     return False
 
 
-#: 状态库里"主动不上传"的跳过原因。只有这些原因才允许在"本地已渲染"时删源；
-#: 其它 skipped（例如 reconciler 丢弃中断产物）必须保留，等人工确认。
-_SKIP_REASONS_OK = ('跳过上传规则', '低于', '阈值', 'min_length', 'skip_upload',
-                    '过短', '时长')
+#: 状态库里"主动不上传"的专用标记。只有带这个前缀的 skipped 才允许在
+#: "本地已渲染"时删源；其它 skipped 必须保留，等人工确认。
+#:
+#: ⚠️ 2026-11-16 第二轮复审 N-6：原来是关键词白名单
+#: ('跳过上传规则','低于','阈值','min_length','skip_upload','过短','时长')，
+#: 而「文件太小/大小未知」写下的 skipped 原因里恰好带 '低于/阈值' —— 于是一个
+#: 残缺小成品就能让本工具删掉唯一完好源。改用 DMR/state/enums.py 里的专用前缀。
+try:
+    from DMR.state.enums import SKIP_RULE_MARK as _SKIP_MARK
+except Exception:                                                # 独立运行兜底
+    _SKIP_MARK = 'skip_upload_rule'
+
+
+def _is_rule_skipped(reason) -> bool:
+    return str(reason or '').strip().lower().startswith(_SKIP_MARK)
 
 
 def _norm_path(p):
@@ -378,7 +426,12 @@ def find_candidates(min_age_minutes=1440):
             #    "渲染完成"当成"已上传"。渲染成功但上传失败的分段，源视频是
             #    唯一原始画质副本，删了就永久丢失。现在必须查状态库。
             stem = os.path.splitext(f)[0]
-            if _exists_rendered(stem, rendered_files):
+            _prod_name = _rendered_match(stem, rendered_files)
+            if _prod_name is not None and not _product_ok(
+                    os.path.join(out_dir, _prod_name)):
+                skipped.append((p, f'成品 {_prod_name} 不完整（0 字节或缺索引），不删源'))
+                continue
+            if _prod_name is not None:
                 if state_map is None:
                     skipped.append((p, '本地已渲染，但状态库不可用，无法确认上传状态'))
                     continue
@@ -388,8 +441,7 @@ def find_candidates(min_age_minutes=1440):
                     ok.append((p, os.path.getsize(p), age_min,
                                '本地已渲染 + 状态库确认已上传'))
                     continue
-                if dm_state == 'skipped' and \
-                        any(k in dm_reason for k in _SKIP_REASONS_OK):
+                if dm_state == 'skipped' and _is_rule_skipped(dm_reason):
                     ok.append((p, os.path.getsize(p), age_min,
                                f'本地已渲染 + 按规则跳过上传（{dm_reason[:40]}）'))
                     continue

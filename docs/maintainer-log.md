@@ -1402,3 +1402,133 @@ dm_video 槽位）。578 个测试当时全绿，因为没有任何用例走过"
 **日志里的"N 条待办"如果没有对应的执行者，就是假队列。** 下次看到"加载了 N 个
 某某任务"这类话，先问两件事：谁会消费这份清单？它和状态库是不是同一套口径？
 口径分裂时，条目会同时被两套机制无视，而且**永远**不消失。
+
+---
+
+# 2026-11-16 深夜 · 第二轮复审：4 个高危新 bug、1 个修错、1 次历史库事故
+
+外部复审报告（`DMR修复复审-20261116.md`）对 97 个文件、+4027/-765 的修复批次
+做了全量核读。结论：约 40 项修对，但**修复本身引入了会删好成品/唯一源的新 bug**。
+逐条复核后确认并修复如下（每条都写了会失败的新用例）。
+
+## 一、会删好文件的三个（红线）
+
+### N-2 探测失败被当成坏文件 → 删成品
+`_dm_product_ok` 用 `FFprobe.get_media_duration()` 判 `> 0`，而它**把所有异常吞成 -1**
+（ffprobe 没装、300 秒超时、权限错误）。于是"探测本身失效"= "文件是坏的" →
+调用方 `os.remove`。docstring 写着"不在探测本身出错时判坏"，实现正好相反。
+
+修法：新增 `FFprobe.probe_status()` **三态**探测
+（`ok` / `unreadable` / `unavailable`）：只有 ffprobe 正常跑起来、退出码非 0
+且 stderr 明确拒绝这个文件时才判坏；探测不可用一律 fail-open。
+
+### N-3 扫包失败回退墙钟 → A-1 误删事故复现
+`dmrender` 的时长闸门在"包时长扫不出来"或"合理性闸拒绝"时，回退到
+`弹幕最后时间戳 / 最小候选` —— 两者都是**墙钟时间轴**。A-1 那三起误删
+（产物 101%/100%/100% 被判 86%/74%/83%）在扫包失败或容器时长虚低（FLV 虚报
+5.7 倍）时**原样复现**，照样 `os.remove`。
+
+修法：fail-open —— 拿不到可信的可解码时长就不判、保留产物、记 warning。
+真截断仍由"media_dur 与容器跨度自洽"那条路径拦住。
+顺带更正注释里的性能数据：不是"4GB/1h ≈ 1.2 秒"，实测 **2.04GB ts 扫包 15.4 秒**。
+
+### N-6 SKIPPED 关键词闸门双向失配
+清理闸门（`maintenance.clean_confirmed_uploaded` 与 `tools/clean_sources.py`）靠
+关键词白名单（`'低于' / '阈值' / '时长' …`）判断"这段是按规则跳过上传、源可以删"。
+而 `_handle_unusable` 给"文件太小/大小未知"写的 SKIPPED 原因**恰好带这些词**
+（生产库里实有 12 条 `'文件仅 15.6MB，低于 30MB 阈值'`）→ 残缺小成品也能让闸门
+认定"处理完了"，删掉唯一完好源。反方向也坏：真正按规则跳过的行当年**不写原因**
+（`d993c2b2` 两条 `last_error=None`）→ 永远清不掉。
+
+修法：引入专用标记 `DMR/state/enums.py:SKIP_RULE_MARK = 'skip_upload_rule'`，
+按规则跳过时写入 `last_error='skip_upload_rule: <判定细节>'`，闸门**只认这个前缀**；
+`_handle_unusable` 改落 `FAILED`（同为终态、不在清理白名单）；两个清理入口
+再各自加一道"成品必须真的能播"（`FFprobe.is_playable`：非 0 字节 + mp4 能解析
+容器时长）。历史行没有前缀 → 不再被误删（保守方向），要清走人工。
+
+## 二、恢复链的崩溃与假状态
+
+### N-1 settle 塞字符串进槽位 → 整轮恢复崩溃
+`_settle_existing_product` 写 `slot['file'] = output`（str）。同轮
+`_check_for_upload` → `_passes_length_gate` 里访问 `video.path` →
+`AttributeError: 'str' object has no attribute 'path'`，异常被启动恢复循环
+"warning+continue" 吞掉 → **该任务整轮恢复中止**（其它分段的补派/补传全丢）。
+正好打在"成品做完还没传"这条本来要修好的路径上；新增的 settle 测试全用
+`auto_upload=False`，恰好绕开。
+
+修法：`_product_video_info()` 按 `dmrender.render_one` 的口径构造真 `VideoInfo`
+（deepcopy 源 → path/dtype/file_id/size/dm_file_id/src_video_id），槽位里不再有 str。
+
+### N-4 弹幕配对正则打反
+`tools/recover_ffmpeg_segments.py` 的 `_token14_of` 用 `re.findall(r'\d{14}')`
+要求**连续 14 位数字**，而真实命名是 `YYYYMMDD-HHMMSS`（带连字符，工具自己的
+分段正则就是 `\d{8}-\d{6}`）→ 所有候选被跳过 → `find_danmaku` 恒 None →
+孤儿分段恢复时"没找到配对弹幕"，渲染必失败。修法：先剥非数字再滑动取 14 位。
+
+### N-7 跳过品被假标"已上传"
+待删清单里既有"上传确认后排队"，也有"命中跳过规则、源照删成品留本地"。
+settle 只凭文件名命中就标 UPLOADED → 状态库与界面永久显示假"已上传"，
+以后关掉跳过规则也不补传。修法：以库里既有状态为准，SKIPPED 保持 SKIPPED。
+
+### L-3 删了成品却落终态
+`_discard_broken_render` 原来写 `FAILED`（终态、不可恢复）→ "文件删了 + 状态终态"
+= 永不重渲；源若已被清理则彻底丢。改为**删掉该产物记录**，语义即"弹幕版还不存在"，
+src_video 仍可恢复 → 下轮对账自动重派。
+
+## 三、配置与守护
+
+- **N-5 dryrun 连生产库**：代码读 `get_config('state')`，而 default.yml 与 dryrun
+  都写 `state_args` —— 键名对不上，用户的 `db_path` 被静默忽略，dryrun 实际打开
+  **生产**库并执行写操作。统一读 `state_args`（`DMR/__init__.py` 两处）。
+- **N-8 守护认不出真身**：`DMR_Q` 要求命令行含项目名，但真身是
+  `C:/Python311/python.exe main.py --quiet`（无项目名），venv 的
+  `python.exe` 只是启动器。启动器一没就判"没在跑"→ 反复拉起 → 撞 Global 互斥体
+  exit 3 → 10 秒重拉。`autostart_launch.dmr_processes()` 改为 psutil 归属判定
+  （exe 在项目下 / cwd == 项目根 / 父进程链 / 命令行兜底），
+  `post_boot_check` 复用同一判据。
+- **漏修 selfcheck youtube**：`DMR/Uploader/youtubev3.py` 早已删除，但注册表仍挂着它、
+  `default.yml` 模板里还有整段 youtube 配置 —— 用默认配置新建任务就会被带进坑。
+  删掉 default.yml 的 youtube 段（57 行）与注册表项；selfcheck 补 GBK 护栏
+  （它打印 ✓ 但没接 `ensure_utf8_stdout`，是 R-1 的唯一漏网）。
+- **A-3 去重键不含输出**：`_video_key` 只用源路径，transcode 与 dmrender 同源
+  会互相顶掉（生产 auto_transcode 全 False，潜伏）。键加上输出路径。
+- **D-9 failed_uploads 保护死代码**：真实结构是 `{'files': [...]}`，原来只找
+  `('video','src_video','file')` → 永不命中。补上 files 列表。
+
+## 四、一次事故：单元测试把生产历史库洗了
+
+`unit_tests/test_state_init.py` 的配置模板写 `state:`，而 N-5 修好后代码读
+`state_args` —— 于是用例退回默认相对路径 `logs/dmr_state.db`，**直接连上生产库**。
+更糟的是启动时的"孤儿任务清理"看到测试配置里只有一个 `test` 任务，就按
+"用户换了配置目录"把 22 个历史场次（10-15 ~ 11-03）当成孤儿**全部删除**
+（sessions 29 → 7，artifacts 143 → 22）。
+
+处置：
+1. 停机 → 备份三件套到 `.temp/quarantine/db-restore-20261116/`；
+2. 从私有仓库的库快照（`F:/DanmakuRepo-full`，17:52）`ATTACH` + `INSERT OR IGNORE`
+   合并回 26 个场次 / 129 条产物 / 105 个上传组，保留 17:52 之后新增的 3 个场次；
+3. 删掉测试留下的 `sess-resume/test` 场次；
+4. 校验：32 个场次、150 条产物、`integrity_check=ok`；重启后 0 错误、无再次净化。
+
+两条防线（都加了）：
+- `unit_tests/support.py` 里硬闸门：任何用例试图打开**生产** `logs/dmr_state.db`
+  直接抛异常（宁可测试红，也不能写生产库）。
+- 孤儿清理改为**显式开启**（`state_args.purge_orphan_tasks`，默认 false）：
+  只隔离保留。避免崩溃循环靠"隔离放行"已足够，自动删历史的收益远小于误删代价。
+
+## 五、验证
+
+- 全量 **600 tests OK**（583 → 600，新增 17 条，其中 N-1/N-2/N-4/N-7/N-8 各有
+  "改回旧代码就红"的回归用例）
+- 启动日志：`对账完成 … 待恢复 0 项，错误 0 条`、`Loaded 0 failed render tasks.`、
+  **0 error / 0 warning**；库内 sessions 34 / artifacts 155（历史完整，无二次净化）
+- `tools/selfcheck.py` 通过（youtube 断言不再失败）
+
+## 六、没修的（复审 N-9 / 第四节剩余）
+
+`D-1`（biliwebapi 部分成功后整组重传、按 filename 去重）、`S-4`（doctor 诊断包日志
+未脱敏）、`D-8`（build_dir --out-dir 不脱敏）、`D-7`（迁移误改 title 等非路径字符串）、
+`L-2`（跨重启重试仍失效，映射纯内存）、`S-1`（force_login=False 时不受收窄约束）、
+`S-2` 剩余（PUBLIC_EXTRAS 里的脱敏工具自身含真实房间号；**git 历史未重写**）、
+`R-3`（无人设 DMR_NONINTERACTIVE）、`R-7`（mode_supervise 不拿锁）。
+其中 S-2 的 git 历史重写属破坏性操作，必须由你确认后再做。

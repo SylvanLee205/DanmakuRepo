@@ -17,6 +17,7 @@
     print(report.summary())
 """
 from .enums import (
+    SKIP_RULE_MARK,
     TERMINAL_ARTIFACT_STATES,
     UNSTABLE_ARTIFACT_STATES,
     ArtifactKind,

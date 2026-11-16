@@ -5,11 +5,13 @@ import logging
 PROGRESS = 25
 if logging.getLevelName(PROGRESS) != 'PROGRESS':
     logging.addLevelName(PROGRESS, 'PROGRESS')
+import copy
 import json
 import os
 import time
 from .baseevents import BaseEvents
 from ..state import (
+    SKIP_RULE_MARK,
     ArtifactKind,
     ArtifactState,
     is_recovered_file_usable,
@@ -204,12 +206,15 @@ class LiveEvents(BaseEvents):
             return False
 
     def _sync_artifact(self, group_id: str, vtype: str, segment_idx: int,
-                       *, path=None, state=None, origin=None) -> None:
+                       *, path=None, state=None, origin=None,
+                       last_error=None) -> None:
         """把某个槽位的状态镜像到状态库。
 
         - ``state=None`` 时按当前内存状态推导；仍推导不出（``None``）则**不写入**，
           避免把已登记的 ``RECORDED`` 覆盖成"尚未处理"。
         - 产物不存在时按需补建（kind 由 ``vtype`` 映射），保证后续状态能挂上去。
+        - ``last_error`` 传字符串时写进载荷：清理闸门靠它区分"按规则跳过上传"
+          与"文件太小被跳过"（2026-11-16 复审 N-6），不能只写状态不写原因。
         """
         kind = _VTYPE_TO_KIND.get(vtype)
         if kind is None or self.state_repo is None:
@@ -240,13 +245,17 @@ class LiveEvents(BaseEvents):
             if self.state_repo.get_artifact(key) is None:
                 self.state_repo.upsert_artifact(
                     key, group_id, segment_idx, kind, state,
-                    path=path, origin=origin,
+                    path=path, origin=origin, last_error=last_error,
                 )
             else:
                 # 产物已存在（例如下载器已登记 SOURCE）→ 只更新状态与路径。
                 # 路径必须一并更新：渲染/转码完成后成品路径会变，
                 # 只写状态会留下一个指向旧文件的记录。
-                self.state_repo.set_artifact_state(key, state)
+                if last_error is None:
+                    self.state_repo.set_artifact_state(key, state)
+                else:
+                    self.state_repo.set_artifact_state(key, state,
+                                                       last_error=last_error)
                 if path is not None:
                     self.state_repo.set_artifact_path(key, path=path)
             if file_obj is not None:
@@ -359,7 +368,8 @@ class LiveEvents(BaseEvents):
                 #     → 直接标 UPLOADED，不重传；
                 #   · 否则标 READY，交给同一轮的 _check_for_upload 补传
                 #     （rclone copyto 按 size+mtime 跳过相同文件，代价可控）。
-                self._settle_existing_product(group_id, 'dm_video', idx, output)
+                self._settle_existing_product(group_id, 'dm_video', idx, output,
+                                              source_video=video)
                 continue
             render_msg = PipeMessage(
                 source=self.name,
@@ -432,7 +442,45 @@ class LiveEvents(BaseEvents):
         self._confirmed_stems_cache = stems
         return stems
 
-    def _settle_existing_product(self, group_id, vtype, idx, output) -> None:
+    def _product_video_info(self, output: str, source_video=None):
+        """把"成品路径"包成 ``VideoInfo``（槽位里的 ``file`` 必须是它，不能是 str）。
+
+        ⚠️ 2026-11-16 第二轮复审 N-1：settle 原来直接写 ``slot['file'] = output``
+        （str）。同轮的 ``_check_for_upload`` 会拿它去 ``_passes_length_gate``，
+        那里访问 ``video.path`` / ``video.size`` —— str 上都没有 →
+        ``AttributeError: 'str' object has no attribute 'path'``。
+        异常一路冒到 ``DMR/__init__.py`` 的恢复循环被 "warning+continue" 吞掉，
+        **该任务整轮恢复中止**（其它分段的补派、补传全丢），而且只发生在
+        "成品做完但还没传"这条本来要修好的路径上。
+        单测当时全用 ``auto_upload=False``，恰好绕开了这条分支。
+
+        字段口径与 ``dmrender.render_one`` 的成功分支保持一致。
+        """
+        from ..utils import VideoInfo
+
+        info = None
+        try:
+            info = copy.deepcopy(source_video) if source_video is not None else None
+        except Exception as e:                                   # noqa: BLE001
+            self.logger.debug(f'复制源视频信息失败，改用最小 VideoInfo：{e}')
+        if not isinstance(info, VideoInfo):
+            info = VideoInfo(path=output)
+        info.path = output
+        info.dtype = 'dm_video'
+        info.file_id = uuid()
+        info.dm_file_id = None
+        info.src_video_id = getattr(source_video, 'file_id', None)
+        info.upload_group_id = None      # 由上传流程按 group_key 重新挂
+        try:
+            info.size = os.path.getsize(output)
+        except OSError:
+            info.size = None
+        # 时长留空：闸门会按"未知"走真实探测，别拿源视频的时长冒充
+        info.duration = 0
+        return info
+
+    def _settle_existing_product(self, group_id, vtype, idx, output,
+                                 source_video=None) -> None:
         """成品已在磁盘上：把状态收敛成终态，别让它在每次重启时反复"待恢复"。"""
         seg_no = self._seg_no(group_id, vtype, idx)
         stem = os.path.splitext(os.path.basename(output))[0]
@@ -441,9 +489,37 @@ class LiveEvents(BaseEvents):
         uploaded = src_stem in self._confirmed_upload_stems()
         group = self.state_dict.get(group_id) or []
         slot = group[idx].get(vtype) if idx < len(group) else None
+        # ⚠️ 2026-11-16 第二轮复审 N-7：待删清单里**既有"上传确认后排队"，
+        #    也有"命中跳过上传规则、源照删、成品留本地"**两种来源。
+        #    只凭 stem 命中就判 uploaded，会把从未上传过的跳过品标成已上传 ——
+        #    状态库与界面永久显示假"已上传"，以后关掉跳过规则也不会补传。
+        #    以库里的既有状态为准：它是 SKIPPED 就保持 SKIPPED。
+        existing_state = None
+        try:
+            if self.state_repo is not None:
+                _rec = self.state_repo.get_artifact(
+                    make_artifact_key(group_id, _VTYPE_TO_KIND[vtype], seg_no))
+                existing_state = str(_rec.state) if _rec is not None else None
+        except Exception as e:                                   # noqa: BLE001
+            self.logger.debug(f'读取产物 {seg_no} 既有状态失败：{e}')
+        was_skipped = existing_state == str(ArtifactState.SKIPPED)
+        if was_skipped:
+            uploaded = False
+        file_info = self._product_video_info(output, source_video) \
+            if vtype == 'dm_video' else output
         if slot is not None:
-            slot['status'] = 'uploaded' if uploaded else 'ready'
-            slot['file'] = output
+            if was_skipped:
+                slot['status'] = 'upload_skipped'
+            else:
+                slot['status'] = 'uploaded' if uploaded else 'ready'
+            slot['file'] = file_info
+        if was_skipped:
+            self._sync_artifact(group_id, vtype, seg_no, path=output,
+                                state=ArtifactState.SKIPPED)
+            self.logger.info(
+                f'状态已对齐：{os.path.basename(output)} 早前按跳过上传规则处理'
+                f'（从未上传），保持 skipped。')
+            return
         self._sync_artifact(
             group_id, vtype, seg_no, path=output,
             state=(ArtifactState.UPLOADED if uploaded else ArtifactState.RENDERED))
@@ -625,42 +701,65 @@ class LiveEvents(BaseEvents):
         * 正常收尾的 mp4 一定写了 moov，``FFprobe`` 必然读得出时长；
         * 读不出时长只可能是"进程被中途杀掉、索引没落盘"（moov atom not found）。
 
-        只对 mp4/mov/m4v 做这个判断（本程序渲染固定输出 mp4）；其它容器一律信任，
-        也**不在探测本身出错时判坏**（例如环境里没有 ffprobe）。
+        只对 mp4/mov/m4v 做这个判断（本程序渲染固定输出 mp4）；其它容器一律信任。
+
+        ⚠️⚠️ 2026-11-16 第二轮复审 N-2 修：原来这里用 ``get_media_duration()``
+        并判 ``> 0``。而它把所有异常都吞成 **-1**（ffprobe 不存在、300 秒超时、
+        权限错误……），于是"探测本身失效"被当成"文件是坏的" → 调用方
+        ``_discard_broken_render`` **os.remove 掉好成品**。docstring 当时写的
+        "不在探测本身出错时判坏"与实现正好相反。
+        现在改用三态 ``probe_status()``：只有 ffprobe **正常跑起来并明确拒绝**
+        这个文件时才判坏，探测不可用时一律放行（fail-open）。
         """
         path = getattr(video, 'path', None)
         if not path or not os.path.exists(path):
             return True   # 路径问题交给上层"文件不存在"那条路径，不在这里判坏
         if os.path.splitext(path)[1].lower() not in ('.mp4', '.mov', '.m4v'):
             return True
-        try:
-            duration = FFprobe.get_media_duration(path)
-        except Exception as e:
-            self.logger.debug(f'探测 {path} 时长失败，按可信处理：{e}')
+        status, detail = FFprobe.probe_status(path)
+        if status == FFprobe.PROBE_UNAVAILABLE:
+            self.logger.warning(
+                f'探测 {path} 的可用性时探测工具本身不可用（{detail}），'
+                f'按可信处理，不删文件。')
             return True
-        try:
-            duration = float(duration)
-        except (TypeError, ValueError):
-            return False
-        return duration > 0
+        if status == FFprobe.PROBE_OK:
+            return True
+        # PROBE_UNREADABLE：ffprobe 跑起来了，明确读不了这个文件
+        self.logger.warning(f'成品 {path} 无法解析（{detail}），判定为残缺。')
+        return False
 
     def _discard_broken_render(self, artifact, video) -> None:
-        """删除不完整的弹幕版成品，并把该产物记为失败（等重新渲染）。"""
+        """删除不完整的弹幕版成品，并把这条产物记录摘掉（等重新渲染）。
+
+        ⚠️ 2026-11-16 第二轮复审 L-3：原来这里把产物写成 ``FAILED``。
+        而 ``FAILED`` 是**终态**、不在 ``RESUMABLE_STATES`` 里 —— 于是
+        "文件已删除 + 状态是终态" = 这段弹幕版**永远不会再渲染**；
+        如果源视频此时已经被清理规则删掉（或已 uploaded/cleaned），
+        这段录像就彻底没了，日志还谎称"已重新派发渲染"。
+        改成删掉这一行产物记录，语义就是"这个弹幕版还不存在"，
+        src_video 仍处于可恢复状态 → 下一轮对账自然会重新派发渲染。
+        """
         path = getattr(video, 'path', None)
         self.logger.warning(
             f'恢复出的弹幕版成品不完整（渲染被中断，读不出时长）：{path}；'
-            f'已删除并重新派发渲染。')
+            f'已删除，产物记录一并摘掉以便重新渲染。')
         try:
             if path and os.path.exists(path):
                 os.remove(path)
         except Exception as e:
             self.logger.warning(f'删除不完整成品失败 {path}: {e}')
         try:
-            self.state_repo.set_artifact_state(
-                artifact.artifact_id, ArtifactState.FAILED,
-                last_error='渲染被中断，成品不完整，已重新派发渲染')
+            if self.state_repo is not None:
+                self.state_repo.delete_artifact(artifact.artifact_id)
         except Exception as e:
-            self.logger.debug(f'标记产物 {artifact.artifact_id} 状态失败：{e}')
+            # 删不掉记录时退回 FAILED（至少不会停在 running 态反复重试）
+            self.logger.warning(f'移除产物 {artifact.artifact_id} 记录失败：{e}')
+            try:
+                self.state_repo.set_artifact_state(
+                    artifact.artifact_id, ArtifactState.FAILED,
+                    last_error='渲染被中断，成品不完整，需重新渲染')
+            except Exception:
+                pass
 
     def _retriable_map(self) -> dict:
         """「失败请求 → 槽位」映射（延迟初始化）。
@@ -737,13 +836,20 @@ class LiveEvents(BaseEvents):
                 except OSError as e:
                     self.logger.warning(f'删除不可用产物 {path} 失败：{e}')
         try:
+            # ⚠️ 2026-11-16 第二轮复审 N-6：这里**不能**写 SKIPPED。
+            #    SKIPPED 在清理闸门里代表"该传的都处理完了，源可以删"，
+            #    而这里的实际情况恰恰相反 —— 文件太小/大小未知，产物可能残缺。
+            #    生产库里已有一批 `skipped + '文件仅 X MB，低于 30MB 阈值'`，
+            #    原因文本又命中闸门的关键词白名单（'低于'/'阈值'），
+            #    一旦 --apply，就会删掉唯一完好源。FAILED 同为终态、同样不自动
+            #    重试，但不在清理白名单里，语义也对：这是失败，不是"按规则跳过"。
             self.state_repo.set_artifact_state(
-                item.artifact_id, ArtifactState.SKIPPED, last_error=reason)
+                item.artifact_id, ArtifactState.FAILED, last_error=reason)
         except Exception as e:
-            self.logger.warning(f'标记产物 {item.artifact_id} 为 skipped 失败：{e}')
+            self.logger.warning(f'标记产物 {item.artifact_id} 为 failed 失败：{e}')
         self.logger.warning(
             f'产物 {item.artifact_id} 不满足恢复条件（{reason}），'
-            f'已标记为 skipped，不再重试。')
+            f'已标记为 failed，不再重试。')
 
     def _compute_output_path(self, video) -> str | None:
         """按 ``download_args`` 的命名规则算出该产物的最终路径。
@@ -990,24 +1096,28 @@ class LiveEvents(BaseEvents):
             # 会误伤 —— 重启后从状态库重建的 VideoInfo 本来就没有时长字段
             # （库里的 duration 常为空），文件其实是好的。
             # 这里补一次真实探测，把"数据缺失"和"文件残缺"区分开：
-            #   · 探测能读出时长 → 好文件，按 min_length 正常判断
-            #   · 探测读不出      → 缺 moov 的残缺成品，拒绝上传（需重渲）
-            _probed = 0.0
-            try:
-                _probed = float(FFprobe.get_media_duration(video.path))
-            except Exception as e:
-                self.logger.debug(f'补探 {video.path} 时长失败：{e}')
-            if _probed > 0:
-                video.duration = _probed
-                if _probed < min_length:
+            #   · 能读出时长   → 好文件，按 min_length 正常判断
+            #   · 明确读不了   → 缺 moov 的残缺成品，拒绝上传（需重渲）
+            #   · 探测工具不可用 → 退回大小兜底（环境问题不能变成"拒传好文件"）
+            # ⚠️ 2026-11-16 第二轮复审：原来用 get_media_duration（整文件扫包，
+            #    2GB 实测 15 秒），且把"探测失败"当"文件残缺"。改用 probe_status
+            #    读容器头即可，并且三态区分。
+            _st, _detail = FFprobe.probe_status(video.path)
+            if _st == FFprobe.PROBE_OK:
+                video.duration = _detail
+                if _detail < min_length:
                     self.logger.info(
-                        f'视频{video.path}时长为{_probed:.0f}s，设置{min_length}s，跳过上传。')
+                        f'视频{video.path}时长为{_detail:.0f}s，设置{min_length}s，跳过上传。')
                     return False
                 return True
-            self.logger.error(
-                f'视频{video.path}读不出时长（渲染产物缺索引，多半是被中途终止的'
-                f'残缺文件），跳过上传 —— 需要重新渲染。')
-            return False
+            if _st == FFprobe.PROBE_UNREADABLE:
+                self.logger.error(
+                    f'视频{video.path}读不出时长（{_detail}）：渲染产物缺索引，'
+                    f'多半是被中途终止的残缺文件，跳过上传 —— 需要重新渲染。')
+                return False
+            self.logger.warning(
+                f'探测 {video.path} 时 ffprobe 不可用（{_detail}），'
+                f'退回按文件大小判定是否可上传。')
 
         min_size_mb = self._min_valid_size_mb()
         size = getattr(video, 'size', None)
@@ -1072,8 +1182,16 @@ class LiveEvents(BaseEvents):
                     # 判断跳过规则（浪费），而且库里显示 rendered/recorded
                     # 看起来像"卡住了"。SKIPPED 不在 RESUMABLE_STATES，
                     # 写进去之后重启就不会再重跑。
-                    self._sync_artifact(group_id, vtype, self._seg_no(group_id, vtype, idx),
-                                        state=ArtifactState.SKIPPED)
+                    # ⚠️ 2026-11-16 复审 N-6：**必须带原因**，而且原因要带专用
+                    # 前缀。清理闸门（maintenance.clean_confirmed_uploaded /
+                    # tools/clean_sources）只有看到这个前缀才敢删源视频 ——
+                    # 之前写库不带 last_error，生产库里 d993c2b2 两条 skipped
+                    # 的 last_error 是 None，于是"该清的永远清不掉"。
+                    self._sync_artifact(
+                        group_id, vtype, self._seg_no(group_id, vtype, idx),
+                        state=ArtifactState.SKIPPED,
+                        last_error=(f'{SKIP_RULE_MARK}: '
+                                    f'{info.get("skip_reason") or "命中跳过上传规则"}'))
                     continue
                 for upload_file_types, upload_arg in upload_args.items():
                     # 判断当前视频是否需要上传
@@ -1521,6 +1639,9 @@ class LiveEvents(BaseEvents):
         )
         info['upload_skipped'] = True
         info['status'] = 'upload_skipped'
+        # 把判定细节留在内存槽位里：调用方要把它写进状态库的 last_error，
+        # 清理闸门靠这个专用前缀区分"按规则跳过"和"文件太小被跳过"。
+        info['skip_reason'] = str(detail)
         return True
 
 

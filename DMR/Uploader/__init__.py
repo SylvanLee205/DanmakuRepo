@@ -20,10 +20,14 @@ def _import_engine(module: str, cls: str):
 
 
 #: 引擎名 -> 惰性加载器。集中在此处，新增引擎只需加一行。
+#: ⚠️ 2026-11-16 第二轮复审：`youtubev3` 已从仓库删除（模块文件不存在），
+#:    但注册表里一直挂着它，配置里一旦写了 engine: youtubev3 会在上传时才
+#:    ModuleNotFoundError。默认配置里的 youtube 段也一并删掉，避免"模板自带的
+#:    坑"（用默认配置新建任务就会被带进去）。要恢复 YouTube 上传请先补回
+#:    DMR/Uploader/youtubev3.py，再加一行注册。
 _UPLOADER_ENGINES = {
     'biliuprs': lambda: _import_engine('.biliuprs', 'biliuprs'),
     'subprocess': lambda: _import_engine('.subprocess_uploader', 'SubprocessUploader'),
-    'youtubev3': lambda: _import_engine('.youtubev3', 'youtubev3'),
     'biliwebapi': lambda: _import_engine('.biliwebapi', 'BiliWebApi'),
 }
 

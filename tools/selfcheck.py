@@ -10,6 +10,18 @@ import tempfile
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
+# ⚠️ 2026-11-16 第二轮复审 R-1 唯一漏网：下面会打印 ✓（U+2713），GBK 控制台直接
+#    UnicodeEncodeError 崩在半路。全仓约 40 个工具都接了 _guard 的护栏，只有这里漏了。
+try:
+    from _guard import ensure_utf8_stdout as _ensure_utf8
+    _ensure_utf8()
+except Exception:                                                # noqa: BLE001
+    try:
+        sys.stdout.reconfigure(errors='replace')
+        sys.stderr.reconfigure(errors='replace')
+    except Exception:                                            # noqa: BLE001
+        pass
+
 logging.basicConfig(level=logging.INFO, format='[%(levelname)s][%(name)s]: %(message)s')
 
 from DMR.Config import Config
