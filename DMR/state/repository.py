@@ -430,19 +430,28 @@ class StateRepository:
             "duration": duration,
             "resolution": resolution,
             "origin": origin,
-            "attempts": attempts if attempts is not None else 0,
+            # 2026-11-16 修（审查报告 L-7 后半）：原来是
+            #   "attempts": attempts if attempts is not None else 0
+            # 配合下面的保留循环里**不含 attempts**，结果是每次 upsert 都把
+            # 重试计数清零 —— 一个反复失败的产物永远显示 attempts=0，
+            # 既看不出"试过几次"，也让依赖次数的退避策略失效。
+            "attempts": attempts,
+            # last_error 同理：None 表示"本次没有新错误"，应保留原值
             "last_error": last_error,
             "video_info": video_info,
         }
         with self._lock:
             now = _now()
             existing = self._raw_payload(artifact_id)
-            # 与旧列语义保持一致：未显式给出的可选字段沿用已有值（COALESCE 语义），
-            # 而 part_path / last_error 总是被本次调用覆盖。
+            # 未显式给出的可选字段一律沿用已有值（COALESCE 语义）。
+            # ⚠️ 想**清空** last_error 时传空串 ""，不能靠传 None。
             for name in ("path", "danmaku_path", "size", "duration",
-                         "resolution", "origin", "video_info"):
+                         "resolution", "origin", "video_info",
+                         "attempts", "last_error"):
                 if updates[name] is None and name in existing:
                     updates[name] = existing[name]
+            if updates["attempts"] is None:
+                updates["attempts"] = 0   # 全新产物
             payload = self._merge_payload(existing, updates)
             self.conn.execute(
                 "INSERT INTO artifacts(artifact_id, session_id, segment_idx, kind,"
@@ -476,11 +485,19 @@ class StateRepository:
 
         ``last_error`` 与 ``attempts`` 属于载荷，因此这里在已读出的载荷上更新，
         避免整行重写时丢掉其它载荷字段。
+
+        2026-11-16 修（审查报告 L-7 前半）：原来无条件写
+        ``updates = {"last_error": last_error}``，而 ``last_error`` 默认是
+        ``None`` —— 于是失败原因会在**下一次任何状态变更**时被抹掉，
+        "为什么失败"在库里活不过一步。现在 None 表示"不改动"，
+        想显式清空请传空串 ``""``。
         """
         state = ArtifactState(state)
         with self._lock:
             existing = self._raw_payload(artifact_id)
-            updates = {"last_error": last_error}
+            updates = {}
+            if last_error is not None:
+                updates["last_error"] = last_error
             if bump_attempts:
                 updates["attempts"] = int(existing.get("attempts") or 0) + 1
             self.conn.execute(

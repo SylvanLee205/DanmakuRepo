@@ -11,12 +11,40 @@ from datetime import datetime
 
 from DMR.utils import *
 
+
+def safe_config_name(name, *, must_yml=True):
+    """把来自 URL/表单的文件名收敛成 ``configs/`` 下的单层文件名。
+
+    为什么必须做（2026-11-16 审查报告 S-1）：``filename`` 直接来自路由参数，
+    Flask 的 string 转换器**接受反斜杠**，``/config/delete/..%5C..%5Cxxx``
+    会被解码成 ``..\\..\\xxx``，``os.path.join('configs', ..\\..\\xxx)``
+    于是逃出 configs/ —— 局域网内任何知道默认口令的人可以删掉状态库、
+    弹幕版成品等任意文件。
+
+    返回规范化后的文件名；不合法返回 ``None``。
+    """
+    raw = str(name or '').replace('\\', '/').strip()
+    if not raw:
+        return None
+    # 任何分隔符都说明不是"单层文件名"
+    if '/' in raw:
+        return None
+    base = os.path.basename(raw)
+    if base in ('', '.', '..'):
+        return None
+    if base != raw:
+        return None
+    if must_yml and not base.lower().endswith('.yml'):
+        return None
+    return base
+
+
 class WebApi:
     def __init__(
             self,
             pipe:Tuple[queue.Queue, queue.Queue],
             engine=None,
-            host='0.0.0.0',
+            host='127.0.0.1',
             port=5000,
             force_login=True,
             username='admin',
@@ -26,6 +54,17 @@ class WebApi:
         self.send_queue, self.recv_queue = pipe
         self.engine = engine
         self.kwargs = kwargs
+
+        # ── 绑定地址与默认口令的联合约束 ──────────────────────────
+        # 默认口令 admin/admin + host 0.0.0.0 = 局域网内任何人可拿到
+        # 配置编辑/删除权限。不能只改默认值（老配置里仍是 0.0.0.0），
+        # 所以在启动时做一次强制收窄：口令仍是默认值时只允许本机访问。
+        _default_pw = str(password or '').lower() in ('', 'admin', 'password')
+        if _default_pw and str(host) not in ('127.0.0.1', 'localhost', '::1'):
+            logging.getLogger(__name__).warning(
+                'Web 服务仍在使用默认口令（%s），已强制只绑定 127.0.0.1。'
+                '如需局域网访问，请先在配置里设置一个强口令。', username)
+            host = '127.0.0.1'
         
         # WebAPI Config
         self.host = host
@@ -154,6 +193,13 @@ class WebApi:
             config_dir = 'configs'
             content = ""
             check_result = None
+
+            # filename 为 None = 新建（config_create 直接调用本函数）
+            if filename is not None:
+                filename = safe_config_name(filename)
+                if filename is None:
+                    flash('非法的配置文件名。', 'error')
+                    return redirect(url_for('config_list'))
             
             if filename:
                 filepath = os.path.join(config_dir, filename)
@@ -171,6 +217,12 @@ class WebApi:
                 content = content.replace('\r\n', '\n')
                 action = request.form['action']
                 new_filename = request.form.get('new_filename', filename)
+
+                # 表单里的新文件名同样来自用户输入，必须过一遍白名单
+                new_filename = safe_config_name(new_filename)
+                if new_filename is None:
+                    flash('非法的配置文件名（只允许 configs/ 下的单层 .yml）。', 'error')
+                    return redirect(url_for('config_list'))
                 
                 # Validation
                 try:
@@ -211,6 +263,10 @@ class WebApi:
         @self.login_required
         def config_delete(filename):
             config_dir = 'configs'
+            filename = safe_config_name(filename)
+            if filename is None:
+                flash('非法的配置文件名。', 'error')
+                return redirect(url_for('config_list'))
             if filename:
                 if filename.startswith('example-'):
                     flash('示例文件不支持删除。', 'error')

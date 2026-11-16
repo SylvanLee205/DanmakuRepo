@@ -16,6 +16,12 @@ import subprocess
 import sys
 import time
 
+try:                                                             # GBK 控制台下 emoji 打印不崩
+    from _guard import ensure_utf8_stdout as _ensure_utf8
+    _ensure_utf8()
+except Exception:                                                # noqa: BLE001
+    pass
+
 _PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))   # 项目根目录，自动识别（可放在任意路径）
 
 

@@ -51,6 +51,12 @@ import re
 import sys
 import time
 
+try:                                                             # GBK 控制台下 emoji 打印不崩
+    from _guard import ensure_utf8_stdout as _ensure_utf8
+    _ensure_utf8()
+except Exception:                                                # noqa: BLE001
+    pass
+
 _PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))   # 项目根目录，自动识别（可放在任意路径）
 
 
@@ -208,6 +214,69 @@ def _exists_in_cloud(stem, cloud_set):
     return False
 
 
+#: 状态库里"主动不上传"的跳过原因。只有这些原因才允许在"本地已渲染"时删源；
+#: 其它 skipped（例如 reconciler 丢弃中断产物）必须保留，等人工确认。
+_SKIP_REASONS_OK = ('跳过上传规则', '低于', '阈值', 'min_length', 'skip_upload',
+                    '过短', '时长')
+
+
+def _norm_path(p):
+    """把状态库和磁盘上的路径归一化成可比较的键。"""
+    p = str(p or '')
+    if not p:
+        return ''
+    if not os.path.isabs(p):
+        p = os.path.join(ROOT, p)
+    return os.path.normcase(os.path.normpath(p))
+
+
+def _state_map():
+    """读状态库，返回 ``{归一化源路径: (成品状态, 原因)}``。
+
+    为什么必须查库：判据「本地有弹幕版成品」只能证明**渲染完**，不能证明
+    **上传成功**。渲染成功但上传失败/未开始的分段，源视频是唯一原始画质副本，
+    按"本地已渲染"删掉就永久丢失。云端查询对命中 skip_upload_rule 的分段
+    永远为空，也不能作为硬门槛 —— 所以正确的判据是状态库里成品的状态。
+
+    返回 ``None`` 表示库读不出来，调用方必须按"全部保留"处理。
+    """
+    import json
+    import sqlite3
+    db = os.path.join(ROOT, 'logs', 'dmr_state.db')
+    if not os.path.exists(db):
+        print('  [警告] 未找到状态库（logs/dmr_state.db），无法确认上传状态，'
+              '所有"本地已渲染"的源文件一律保留。')
+        return None
+    try:
+        conn = sqlite3.connect(f'file:{db}?mode=ro', uri=True)
+        try:
+            rows = conn.execute(
+                'select artifact_id, kind, state, data from artifacts').fetchall()
+        finally:
+            conn.close()
+    except Exception as e:                                       # noqa: BLE001
+        print(f'  [警告] 状态库读取失败（{e}），所有源文件一律保留。')
+        return None
+
+    dm = {}
+    src = {}
+    for aid, kind, state, raw in rows:
+        try:
+            data = json.loads(raw or '{}')
+        except Exception:                                        # noqa: BLE001
+            data = {}
+        parts = str(aid).rsplit(':', 2)
+        if len(parts) != 3:
+            continue
+        sid, _, idx = parts
+        if kind == 'dm_video':
+            dm[(sid, idx)] = (state, str(data.get('last_error') or ''))
+        elif kind == 'src_video' and data.get('path'):
+            src[_norm_path(data.get('path'))] = (sid, idx)
+    return {path: dm.get(key, ('missing', '状态库无对应成品记录'))
+            for path, key in src.items()}
+
+
 def _pending_clean_names():
     """读取 24h 延迟清理队列里的文件名（按 basename 比对，跨布局都通用）。
 
@@ -231,8 +300,8 @@ def _pending_clean_names():
         # 「队列文件不存在」和「队列为空」是两回事：前者说明这道防护本次
         # 没生效，不能静默当成后者，否则会误以为文件都受队列保护。
         print('  [警告] 未找到 24h 延迟清理队列（pending_clean.json），'
-              '队列防护本次不生效，仅靠 1440 分钟后悔期兜底。')
-        return set()
+              '队列防护本次不生效，按"全部保护"处理，不删除任何文件。')
+        return None
     try:
         with open(q, encoding='utf-8') as f:
             data = json.load(f)
@@ -256,6 +325,7 @@ def find_candidates(min_age_minutes=1440):
         return ok, skipped
 
     pending = _pending_clean_names()
+    state_map = _state_map()
 
     now = time.time()
     for src_dir, out_dir, task in _scan_layouts():
@@ -299,15 +369,35 @@ def find_candidates(min_age_minutes=1440):
                 continue
 
             # 防护 4：必须有"内容已在别处"的证据才能删，二选一：
-            #   a) 本地有弹幕版成品 —— **独立充分**，不需要云端有。
-            #      命中 skip_upload_rule 的分段故意不上传（三条命中两条），
-            #      云端永远查不到，但配置明确写了源视频照常删、弹幕版
-            #      永久留本地。把云端当硬门槛会让这批源视频永远滞留。
+            #   a) 本地有弹幕版成品 **且状态库确认该成品已上传 / 按规则主动跳过上传**
+            #      —— 命中 skip_upload_rule 的分段故意不上传（三条命中两条），
+            #      云端永远查不到，但配置明确写了源视频照常删、弹幕版永久留本地。
             #   b) 本地成品已被移走、但云端确有同名成品 —— 内容已备份。
-            # 注意顺序：a 先判，所以"云端查不到"不会误伤跳过上传的分段。
+            #
+            # ⚠️ 2026-11-16：原来 a) 只看"本地有 .mp4"就放行，等于把
+            #    "渲染完成"当成"已上传"。渲染成功但上传失败的分段，源视频是
+            #    唯一原始画质副本，删了就永久丢失。现在必须查状态库。
             stem = os.path.splitext(f)[0]
             if _exists_rendered(stem, rendered_files):
-                ok.append((p, os.path.getsize(p), age_min, '本地已渲染'))
+                if state_map is None:
+                    skipped.append((p, '本地已渲染，但状态库不可用，无法确认上传状态'))
+                    continue
+                dm_state, dm_reason = state_map.get(
+                    _norm_path(p), (None, '状态库无该分段的记录'))
+                if dm_state == 'uploaded':
+                    ok.append((p, os.path.getsize(p), age_min,
+                               '本地已渲染 + 状态库确认已上传'))
+                    continue
+                if dm_state == 'skipped' and \
+                        any(k in dm_reason for k in _SKIP_REASONS_OK):
+                    ok.append((p, os.path.getsize(p), age_min,
+                               f'本地已渲染 + 按规则跳过上传（{dm_reason[:40]}）'))
+                    continue
+                if dm_state is None:
+                    skipped.append((p, '本地已渲染，但状态库无该分段记录（需人工确认）'))
+                    continue
+                skipped.append((p, f'本地已渲染，但成品状态为 {dm_state}'
+                                   f'（{dm_reason[:40]}），未确认上传/规则跳过'))
                 continue
             # 云端校验
             if cloud_set is not None:
@@ -364,10 +454,16 @@ def main():
 
     if ok and opt.apply:
         print('\n  开始删除...')
+        # 删除前重新读一遍队列：find_candidates 到真正删除之间可能过了几分钟，
+        # DMR 完全可能在这段时间把这批文件写进 24h 队列（刚上传成功）。
+        live_pending = _pending_clean_names()
         n, freed, failed = 0, 0, 0
         for p, sz, _, _ in ok:
-            # 删除前再确认一次：文件还在、且仍然"老"
+            # 删除前再确认一次：文件还在、仍然"老"、且没进 24h 队列
             if not os.path.exists(p):
+                continue
+            if live_pending is None or os.path.basename(p) in live_pending:
+                print(f'    跳过（已进入 24h 延迟清理队列）: {os.path.basename(p)}')
                 continue
             try:
                 if (time.time() - os.path.getmtime(p)) / 60 < opt.min_age:

@@ -68,9 +68,17 @@ for /f "usebackq delims=" %%P in (`python -c "import sys;print(sys.executable)" 
 )
 
 :have_py
-rem Publish DMR_PY to the caller's scope (endlocal does not affect
-rem the value that is expanded on this very line).
-endlocal & set "DMR_PY=%DMR_PY%"
+rem Publish DMR_PY *and* the fixed PATH to the caller's scope.
+rem Both %DMR_PY% and %PATH% below are expanded BEFORE endlocal runs,
+rem so the set commands receive the values from inside setlocal.
+rem
+rem 2026-11-16 (audit R-14): this line used to export DMR_PY only.
+rem The "make core Windows tools reachable" PATH prepend above lives
+rem inside setlocal, so endlocal silently rolled it back -- every child
+rem process (rclone / ffmpeg / schtasks / net use) started from a
+rem session-0 launcher still got a PATH without System32.
+rem Exporting PATH too makes the prepend stick for the caller.
+endlocal & set "DMR_PY=%DMR_PY%" & set "PATH=%PATH%"
 
 rem Guard: the py/python probes above can occasionally print a warning
 rem line instead of a path. Trust nothing that does not exist on disk.

@@ -17,7 +17,13 @@ class FFprobe():
         return ToolsList.get('ffprobe')
     
     @classmethod
-    def run_ffprobe(cls,fpath):
+    def run_ffprobe(cls, fpath, timeout: float = 60):
+        """跑 ffprobe 读容器/流信息。
+
+        ⚠️ 2026-11-16：加 timeout。这里在**渲染线程池**里被调用，遇到损坏
+        文件或网络盘挂起时，无超时的 check_output 会永久占住一个渲染线程；
+        线程池满之后后续所有渲染都排队，表现为"渲染不动了但进程还活着"。
+        """
         out = subprocess.check_output([
             cls.ffprobe(),
             '-i', fpath,
@@ -25,7 +31,7 @@ class FFprobe():
             '-select_streams', 'v:0',
             '-show_format','-show_streams',
             '-v','quiet'
-            ])
+            ], timeout=timeout)
         out = out.decode('utf8')
         res = json.loads(out)
         return res
@@ -36,12 +42,60 @@ class FFprobe():
             res = cls.run_ffprobe(fpath)
             try:
                 st = float(res['format']['start_time'])
-            except:
+            except (KeyError, TypeError, ValueError):
                 st = 0
             duration = float(res['format']['duration'])-st
             return max(duration, 0)
-        except:
+        except subprocess.TimeoutExpired:
+            warnings.warn(f'ffprobe 读取超时（{fpath}）')
             return -1
+        except Exception:                                        # noqa: BLE001
+            return -1
+
+    @classmethod
+    def get_media_duration(cls, fpath, timeout=300) -> float:
+        """按视频包时长求和，得到「可解码媒体时长」（秒），失败返回 -1。
+
+        为什么需要这个口径（2026-11-16）：
+            ``get_duration()`` 读的是 ``format.duration``，那是**时间轴跨度**，
+            包含断流、卡顿、重连留下的空洞；而渲染时 ``-fflags +genpts``
+            会把空洞压掉，产物时长对应的是**真正解码出来的画面总长**。
+            拿跨度当基准，就会把完整产物判成残缺：
+              实测 vvu 11-07 14:19：跨度 3601s，中间 21 处缺口共 514s，
+              实际可解码 3060s，产物 3096s —— 被判成 86% 误删。
+            视频包 ``duration_time`` 求和 ≈ 可解码总长，与产物语义一致。
+
+        :returns: 秒数；拿不到有效包时长时返回 -1（调用方需自行兜底）。
+        """
+        try:
+            out = subprocess.check_output(
+                [
+                    cls.ffprobe(),
+                    '-v', 'error',
+                    '-select_streams', 'v:0',
+                    '-show_entries', 'packet=duration_time',
+                    '-of', 'csv=p=0',
+                    fpath,
+                ],
+                timeout=timeout,
+            )
+        except Exception:
+            return -1
+
+        total = 0.0
+        count = 0
+        for line in out.decode('utf8', 'replace').splitlines():
+            value = line.strip().strip(',')
+            if not value or value in ('N/A', 'nan', 'NaN'):
+                continue
+            try:
+                total += float(value)
+                count += 1
+            except ValueError:
+                continue
+        if count <= 0 or total <= 0:
+            return -1
+        return total
 
     @classmethod
     def run_ffprobe_livestream(cls, url, header=None):
@@ -76,7 +130,7 @@ class FFprobe():
                 res = cls.run_ffprobe(url)
             resolution = res['streams'][0]['width'],res['streams'][0]['height']
             return resolution
-        except:
+        except Exception:                                        # noqa: BLE001
             return 0,0
 
     @classmethod

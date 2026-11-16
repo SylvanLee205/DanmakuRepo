@@ -347,6 +347,11 @@ class DmRender(BaseRender):
 
         # XML 弹幕先转成 ASS（本程序自录的 .ass 会原样返回，临时文件为 None）
         danmaku, temp_danmaku = self._prepare_danmaku(video.path, danmaku)
+        # ⚠️ 2026-11-16：必须在这里读，不能等到下方的时长校验。
+        #    XML 弹幕转出来的临时 .ass 会在渲染结束的 finally 里被删掉，
+        #    等到校验时再读就是"文件不存在 → 返回 0 → 静默回退到墙钟时长"，
+        #    于是所有 XML 来源的渲染都必然走错参考口径。先读一次存下来。
+        dm_last_ts = self._danmaku_last_timestamp(danmaku)
         start_time = datetime.now()
         # 所有渲染调用（首次 / 帧率修正 / 硬件重试）共用这份参数副本，
         # 修正过的参数才不会在重试时丢掉。
@@ -484,24 +489,22 @@ class DmRender(BaseRender):
             # 严重性：下游会上传这个残缺视频，且清理规则会删掉源视频 ——
             # 那一段录播就永久变成残缺品了。
             #
-            # 这里比较"产物时长 vs 源视频时长"，短太多就判定为失败。
-            # 阈值取 90%：正常渲染的时长误差在 1% 以内（弹幕不影响时长），
-            # 90% 足够宽松，不会误杀正常的结尾裁剪。
+            # ⚠️ 2026-11-16 复盘改口径：原实现拿「弹幕最后时间戳 / VideoInfo.duration /
+            #    容器时长」当参考，这三个都是**墙钟时间轴**（含起流等待、卡顿、
+            #    断流重连的空转）；而产物是**媒体时间轴**（-fflags +genpts 已把
+            #    时间戳空洞压掉）。结果完整成品被按 86% / 74% / 83% 判死并删除：
+            #      实测 vvu 11-07 14:19 —— 跨度 3601s，21 处缺口共 514s，
+            #      可解码 3060s，产物 3096s（101%）；
+            #      君君 11-10 19:42 —— 容器 168.3s，产物 168s；
+            #      SFault 11-11 22:05 —— 容器 127.9s，产物 128s。
+            #    现改为以「视频包时长求和」（可解码媒体时长）为准，见
+            #    FFprobe.get_media_duration 的注释。
+            #
+            # 判定式：缺口 > max(3 秒, 参考时长的 10%) 才算残缺。
+            #   90% 阈值保留（正常渲染误差 <1%），额外给短片段 3 秒尾部容差。
+            #   10-18 的 53% 真残缺依然拦得住（缺口 1764 秒 ≫ 379 秒）。
             # 任何异常都只记日志、不影响原有判定（fail-open）。
             try:
-                # 参考时长优先级：
-                #   1) 弹幕最后时间戳 —— 最可靠（FLV 容器时长会虚报，见辅助方法注释）
-                #   2) VideoInfo.duration
-                #   3) ffprobe 读源文件
-                ref_dur = self._danmaku_last_timestamp(danmaku)
-                if ref_dur > 0:
-                    src_dur = ref_dur
-                    ref_src = '弹幕最后时间戳'
-                else:
-                    src_dur = float(getattr(video, 'duration', 0) or 0)
-                    if src_dur <= 0:
-                        src_dur = float(FFprobe.get_duration(video.path) or 0)
-                    ref_src = '源文件容器时长'
                 out_dur = float(FFprobe.get_duration(output) or 0)
 
                 # ⚠️⚠️ 2026-10-19 修漏洞：产物**读不出时长**必须当失败。
@@ -523,16 +526,51 @@ class DmRender(BaseRender):
                         f'渲染产物不可读（moov 缺失 / 文件未收尾，'
                         f'{_sz/1024**2:.1f} MB）。ffmpeg 输出尾部:\n{str(info)[-800:]}')
 
+                # 先收集「廉价参考」：录制墙钟 / 容器跨度 / 弹幕最后时间戳。
+                # 产物只要不短于其中最大的那个的 98%，就不可能是被截断的，
+                # 直接放行，省掉扫包的开销（本机实测 4GB/1 小时 ts 约 1.2 秒）。
+                wall_dur = float(getattr(video, 'duration', 0) or 0)
+                fmt_dur = float(FFprobe.get_duration(video.path) or 0)
+                cands = []
+                if wall_dur > 0:
+                    cands.append((wall_dur, '录制墙钟时长'))
+                if fmt_dur > 0:
+                    cands.append((fmt_dur, '源容器时长'))
+                if dm_last_ts > 0:
+                    cands.append((dm_last_ts, '弹幕最后时间戳'))
+
+                src_dur = 0.0
+                ref_src = ''
+                if cands and out_dur < max(c[0] for c in cands) * 0.98:
+                    media_dur = float(FFprobe.get_media_duration(video.path) or -1)
+                    # 合理性闸：包时长求和要求落在容器跨度的 30%~120%。
+                    # 落在区间外通常说明 duration_time 大面积缺失，此时
+                    # 宁可退回「弹幕时间戳 / 最小候选」，也不能拿一个偏小的
+                    # 数当基准（偏小会放过真正的截断）。
+                    if media_dur > 0 and (fmt_dur <= 0
+                                          or 0.3 * fmt_dur <= media_dur <= 1.2 * fmt_dur):
+                        src_dur, ref_src = media_dur, '源可解码媒体时长'
+                    elif dm_last_ts > 0:
+                        src_dur, ref_src = dm_last_ts, '弹幕最后时间戳'
+                    else:
+                        src_dur, ref_src = min(c[0] for c in cands), min(cands)[1]
+                    if ref_src != '源可解码媒体时长':
+                        self.logger.warning(
+                            f'无法精确测量源视频可解码时长，时长校验退回「{ref_src}」'
+                            f'（{src_dur:.0f} 秒），仍按 90% 阈值判定。')
+
                 if src_dur > 0 and out_dur > 0:
-                    ratio = out_dur / src_dur
-                    if ratio < 0.90:
+                    shortfall = src_dur - out_dur
+                    tolerance = max(3.0, src_dur * 0.10)
+                    if shortfall > tolerance:
                         try:
                             os.remove(output)
                         except Exception as e:
                             self.logger.warning(f'删除残缺产物失败 {output}: {e}')
                         return False, (
                             f'渲染产物时长异常：{ref_src} {src_dur:.0f} 秒 → 产物仅 '
-                            f'{out_dur:.0f} 秒（{ratio*100:.0f}%），已删除（源视频保留）。\n'
+                            f'{out_dur:.0f} 秒（缺失 {shortfall:.0f} 秒，'
+                            f'容差 {tolerance:.0f} 秒），已删除（源视频保留）。\n'
                             f'通常是**源视频本身损坏**（录制期间流时间戳错乱），'
                             f'导致编码器中途放弃。ffmpeg 输出尾部:\n'
                             f'{str(info)[-800:]}')

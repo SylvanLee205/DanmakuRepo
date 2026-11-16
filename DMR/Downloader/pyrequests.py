@@ -15,6 +15,16 @@ from os.path import splitext, split, join, exists
 
 from DMR.utils import *
 
+# 2026-11-16 修（审查报告 L-13）：FLV/HLS 的取流请求原先**没有 timeout**。
+# requests 默认无限等，socket 半死不活时 iter_content 永久阻塞在 read 上，
+# 录制线程就此卡死；上层只看 Onair 状态，不会杀掉卡住的线程，
+# 于是一个早已断掉的流会被当成"正在录"，一路录到开播结束。
+# 现在统一用 (连接超时, 读超时)：连续 30 秒收不到字节就抛 ReadTimeout，
+# 由上层按"流结束"处理（重连或切段），不会再无声挂死。
+CONNECT_TIMEOUT = 10
+READ_TIMEOUT = 30
+STREAM_TIMEOUT = (CONNECT_TIMEOUT, READ_TIMEOUT)
+
 
 class PyRequestsFlvDownloader:
     default_header = {
@@ -62,9 +72,10 @@ class PyRequestsFlvDownloader:
     def _download_part(self, stream_iter:requests.Response):
         start_t = datetime.now()
         self.video_file = join(self.output_dir, f'[正在录制]{self.taskname}-{start_t.strftime("%Y%m%d-%H%M%S")}.{self.output_format}')
-        if exists(self.video_file):
-            cnt = len(glob.glob(splitext(self.video_file)[0] + '*'))
-            self.video_file = splitext(self.video_file)[0] + f'({cnt})' + splitext(self.video_file)[1]
+        # 2026-11-16 修（L-10 同型）：原来用 len(glob(...)) 数个数拼 (n)，
+        # glob 未转义 + 数个数不等于找空位，都可能返回已存在的文件名，
+        # 而下面 open(..., 'wb') 会直接截断它。改用安全命名。
+        self.video_file = safe_filename(self.video_file)
 
         if self.inprogress_callback:
             self.inprogress_callback(self.video_file)
@@ -89,7 +100,8 @@ class PyRequestsFlvDownloader:
     def start(self):
         self.logger.debug(f'{self.taskname} PyRequestsFlv: {self.stream_url}')
 
-        stream = self.session.get(self.stream_url, headers=self.header, stream=True)
+        stream = self.session.get(self.stream_url, headers=self.header, stream=True,
+                                     timeout=STREAM_TIMEOUT)
         if stream.status_code != 200:
             raise RuntimeError(f'Error downloading stream: {stream.status_code}')
         stream_iter = stream.iter_content(chunk_size=512*1024)
@@ -225,22 +237,21 @@ class PyRequestsHlsDownloader:
                     self.headfile = self._find_headfile(headfile_uri_origin)
                     if not self.headfile:
                         self.logger.warning(f'{self.taskname}: 未找到原画头文件: {headfile_name}, 即将回退到非原画模式')
-                        self.headfile = self.session.get(headfile_uri).content
+                        self.headfile = self.session.get(headfile_uri, timeout=STREAM_TIMEOUT).content
                         self.force_origin = False
                     t1 = time.time()
                     # 将获取头文件的时间传递给回调函数，让弹幕时间更准确
                     if self.stable_callback:
                         self.stable_callback(t0-t1)
                 else:
-                    self.headfile = self.session.get(headfile_uri).content
+                    self.headfile = self.session.get(headfile_uri, timeout=STREAM_TIMEOUT).content
                 self.headfile_name = headfile_name
 
     def download_part(self):
         now = datetime.now()
         self.video_file = join(self.output_dir, f'[正在录制]{self.taskname}-{now.strftime("%Y%m%d-%H%M%S")}.{self.output_format}')
-        if exists(self.video_file):
-            cnt = len(glob.glob(splitext(self.video_file)[0] + '*'))
-            self.video_file = splitext(self.video_file)[0] + f'({cnt})' + splitext(self.video_file)[1]
+        # 同上（L-10 同型）：open('wb') 会截断同名文件，必须用安全命名
+        self.video_file = safe_filename(self.video_file)
 
         if self.inprogress_callback:
             self.inprogress_callback(self.video_file)

@@ -20,6 +20,12 @@ import subprocess
 import sys
 import time
 
+try:                                                             # GBK 控制台下 emoji 打印不崩
+    from _guard import ensure_utf8_stdout as _ensure_utf8
+    _ensure_utf8()
+except Exception:                                                # noqa: BLE001
+    pass
+
 _PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))   # 项目根目录，自动识别（可放在任意路径）
 
 
@@ -89,8 +95,12 @@ def main():
     CMD_Q = ("Get-CimInstance Win32_Process -Filter \"Name='cmd.exe'\" | "
              "Where-Object { $_.CommandLine -like '*Start_Render*' } | "
              "ForEach-Object { $_.ProcessId }")
+    # 2026-11-16：'*main.py*' 子串会命中 domain.py / 别的项目的 main.py。
+    # 改成正则（main.py 必须作为独立参数）+ 项目名过滤，与 stop_dmr 判据一致。
+    _proj = os.path.basename(UP)
     DMR_Q = ("Get-CimInstance Win32_Process -Filter \"Name='python.exe'\" | "
-             "Where-Object { $_.CommandLine -like '*main.py*' } | "
+             "Where-Object { $_.CommandLine -match '(?i)(^|[\\s\"])main\\.py([\\s\"]|$)'"
+             f" -and $_.CommandLine -like '*{_proj}*' }} | "
              "ForEach-Object { $_.ProcessId }")
     guards = [x for x in ps(CMD_Q).split() if x.isdigit()]
     dmrs = [x for x in ps(DMR_Q).split() if x.isdigit()]
@@ -131,7 +141,7 @@ def main():
 
     # 4. 最新日志
     head('4. 最新日志')
-    logs = sorted(glob.glob(os.path.join(UP, 'logs', 'DMR-2026*.log')),
+    logs = sorted(glob.glob(os.path.join(UP, 'logs', 'DMR-*.log')),
                   key=os.path.getmtime, reverse=True)
     if not logs:
         print('  ❌ 找不到日志')
@@ -154,8 +164,11 @@ def main():
         n_err = txt.count('[error]')
         n_warn = txt.count('[warning]')
         print(f'  已加载任务: {n_task}    ERROR: {n_err}    WARNING: {n_warn}')
-        if n_task < 30:
-            problems.append(f'只加载了 {n_task} 个任务（正常 33）')
+        # 期望任务数按 configs/DMR-*.yml 现算。
+        # 2026-11-16：原来写死"正常 33"，后来接到 46 个主播后每次开机都误报。
+        n_expect = len(glob.glob(os.path.join(UP, 'configs', 'DMR-*.yml')))
+        if n_expect and n_task < n_expect:
+            problems.append(f'只加载了 {n_task} 个任务（配置里有 {n_expect} 个）')
         if n_err:
             problems.append(f'日志里有 {n_err} 条 ERROR')
         hb = txt.count('[心跳]')
@@ -219,7 +232,7 @@ def main():
             print('  DefaultPassword = 已存储 ✅（重启会自动进桌面）')
         else:
             print('  DefaultPassword = 【缺失】⚠️ 重启会停在登录界面，自动登录实际是坏的！')
-            print('     修复：运行 netplwizard 取消勾选"要使用本计算机必须输入用户名和密码"，')
+            print('     修复：运行 netplwiz 取消勾选"要使用本计算机必须输入用户名和密码"，')
             print('           或把密码写进注册表 DefaultPassword。')
             problems.append('AutoAdminLogon=1 但没有 DefaultPassword —— 自动登录失效')
     state = ps("try { (Get-ScheduledTask -TaskName 'DMR_Boot' "

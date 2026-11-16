@@ -12,6 +12,12 @@ import os
 import subprocess
 import sys
 
+try:                                                             # GBK 控制台下 emoji 打印不崩
+    from _guard import ensure_utf8_stdout as _ensure_utf8
+    _ensure_utf8()
+except Exception:                                                # noqa: BLE001
+    pass
+
 _PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))   # 项目根目录，自动识别（可放在任意路径）
 
 
@@ -113,33 +119,51 @@ def main():
         for c in good:
             f.write(f"file '{os.path.abspath(c).replace(chr(92), '/')}'\n")
 
-    if os.path.exists(FINAL):
-        os.remove(FINAL)
-    print(f'  拼接 -> {FINAL}')
+    # ⚠️ 不能先删 FINAL：FINAL 是「（弹幕版）」成品，属项目红线（永不删除）。
+    #    先拼到临时名，校验通过才原子替换，拼接失败时旧成品原样保留。
+    tmp_final = FINAL + '.partial.mp4'
+    if os.path.exists(tmp_final):
+        os.remove(tmp_final)
+    print(f'  拼接 -> {FINAL}（先写临时文件）')
     r = subprocess.run(['ffmpeg', '-v', 'error', '-y', '-f', 'concat',
                         '-safe', '0', '-i', lst, '-c', 'copy',
-                        '-movflags', '+faststart', FINAL],
+                        '-movflags', '+faststart', tmp_final],
                        capture_output=True, text=True, encoding='utf-8',
                        errors='replace', timeout=1800)
     if r.returncode != 0:
         print(f'  ❌ 拼接失败: {(r.stderr or "")[:300]}')
+        print(f'  旧成品未改动: {FINAL}' if os.path.exists(FINAL) else '  （此前没有旧成品）')
+        try:
+            if os.path.exists(tmp_final):
+                os.remove(tmp_final)
+        except OSError:
+            pass
         return 1
 
-    d = duration(FINAL)
-    sz = os.path.getsize(FINAL) / 1024**2
+    d = duration(tmp_final)
+    sz = os.path.getsize(tmp_final) / 1024**2
     print()
     print('=' * 78)
     print(f'✅ 完成  {sz:.1f} MB  时长 {d:.0f}s / 源 {total:.0f}s = {d/total*100:.1f}%')
     print('=' * 78)
 
     # 完整性验证：能完整解码吗
-    r2 = subprocess.run(['ffmpeg', '-v', 'error', '-i', FINAL, '-f', 'null', '-'],
+    r2 = subprocess.run(['ffmpeg', '-v', 'error', '-i', tmp_final, '-f', 'null', '-'],
                         capture_output=True, text=True, encoding='utf-8',
                         errors='replace', timeout=1800)
     nerr = len([l for l in (r2.stderr or '').split('\n') if l.strip()])
     print(f'  解码校验: exit={r2.returncode} 错误行 {nerr}  '
           f'{"✅ 可正常播放" if r2.returncode == 0 else "❌ 有问题"}')
-    return 0 if r2.returncode == 0 else 1
+    if r2.returncode != 0:
+        try:
+            os.remove(tmp_final)
+        except OSError:
+            pass
+        print('  校验未通过，临时文件已删除，旧成品保留。')
+        return 1
+    os.replace(tmp_final, FINAL)
+    print(f'  已替换成品: {FINAL}')
+    return 0
 
 
 if __name__ == '__main__':

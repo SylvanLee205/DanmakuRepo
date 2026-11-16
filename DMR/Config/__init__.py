@@ -168,7 +168,12 @@ class Config():
                         if isinstance(self.global_config.get('clean_args_task_default'), dict) \
                         else None
                 if not task_clean_args:
-                    task_clean_args = {'src_video': {'method': 'delete', 'delay': 0}}
+                    # ⚠️ 2026-11-16：兜底必须是"24 小时后删"，不能是 delay:0。
+                    #    0 延迟意味着上传一成功就立刻删源，绕过用户发现问题的
+                    #    后悔期；一旦 global 的 clean_args 被误删/键名写错，
+                    #    这条兜底就会成为唯一的规则并直接把源删掉。
+                    #    与 global.yml 的 clean_args_task_default 保持一致。
+                    task_clean_args = {'src_video': {'method': 'delete', 'delay': 86400}}
 
                 for clean_file_types, clean_args in task_clean_args.items():
                     if isinstance(clean_args, dict):

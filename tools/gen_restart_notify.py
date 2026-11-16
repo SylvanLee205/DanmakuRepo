@@ -9,6 +9,7 @@
 import json
 import os
 import re
+import subprocess
 import sys
 import time
 
@@ -17,24 +18,23 @@ sys.path.insert(0, ROOT)
 
 from DMR.notify import send, disk_free_gb          # noqa: E402
 
+try:                                                             # GBK 控制台下 emoji 打印不崩
+    from _guard import ensure_utf8_stdout as _ensure_utf8
+    _ensure_utf8()
+except Exception:                                                # noqa: BLE001
+    pass
+
 STATE_FILE = os.path.join(ROOT, '.temp', 'restart_history.json')
 VERSION_FILE = os.path.join(ROOT, 'DMR', '__init__.py')
 
 FLAP_WINDOW = 3600      # 统计窗口（秒）
 FLAP_THRESHOLD = 3      # 窗口内超过这个次数算频繁重启
-MIN_COUNT_GAP = 600     # 距上次计数不足这个秒数不重复计数（防调试时误报）
+MIN_COUNT_GAP = 600     # 人工重启：距上次计数不足这个秒数就不重复计数（防调试误报）
+CRASH_GAP = 120         # 崩溃重启：间隔小于这个秒数视为崩溃循环，**照常计数**
+MAX_TIMES = 200         # 状态文件最多保留多少条，防止崩溃循环把 json 写爆
 DISK_WARN_GB = 30       # 剩余磁盘低于这个值就在通知里告警
 
-
-def _ps(cmd):
-    import subprocess
-    try:
-        r = subprocess.run(['powershell', '-NoProfile', '-Command', cmd],
-                           capture_output=True, text=True, encoding='utf-8',
-                           errors='replace', timeout=20)
-        return ((r.stdout or '') + (r.stderr or '')).strip()
-    except Exception:
-        return ''
+RCLONE_DEFAULT_DEST = 'cd2:百度网盘/DMR录播'
 
 
 def version():
@@ -54,27 +54,68 @@ def version():
     return ''
 
 
-def cd2_ok():
-    """CD2 服务版是否正常（服务在跑 + 19798 在监听）。"""
+def _rclone_dest():
+    """从 configs/global.yml 的 upload_args.rclone.command 里抠出目标路径。
+
+    生产上传实际是 `rclone copy {PATH} cd2:百度网盘/DMR录播/{TASKNAME}`，
+    这里取 `cd2:百度网盘/DMR录播` 作为探活目标。读不到配置就退回默认值
+    （default.yml 里写的就是这个）。
+    """
     try:
-        st = _ps("(Get-Service CloudDrive2 -ErrorAction SilentlyContinue).Status.ToString()")
-        port = _ps("(Get-NetTCPConnection -LocalPort 19798 -State Listen "
-                   "-ErrorAction SilentlyContinue | Measure-Object).Count")
-        if st == 'Running' and port not in ('', '0'):
-            return True, '正常'
-        if st == 'Running':
-            return False, '服务在跑但端口未监听'
-        return False, (st or '服务不存在')
+        p = os.path.join(ROOT, 'configs', 'global.yml')
+        t = open(p, encoding='utf-8', errors='replace').read()
+        m = re.search(r"""command:\s*\[[^\]]*?['"]rclone['"][^\]]*?['"]([A-Za-z0-9_\-]+:[^'"]*)['"]""", t)
+        if m:
+            d = re.sub(r'/\{[A-Za-z_]+\}.*$', '', m.group(1)).rstrip('/')
+            if ':' in d:
+                return d
+    except Exception:
+        pass
+    return RCLONE_DEFAULT_DEST
+
+
+def cloud_ok():
+    """云端通道是否可达：rclone 能列出目标目录就算正常。
+
+    ⚠️ 2026-11-16 修（审查报告 R-13）：
+        CloudDrive2 服务版已于 2026-11-02 下架，上传改为 rclone 直连 WebDAV。
+        原来查 `Get-Service CloudDrive2` + 19798 端口，本机根本没这个服务，
+        于是**每次**启动成功通知都带一条「⚠️ 云端通道：CD2 服务不存在」的假告警。
+        现在直接探真实链路：`rclone lsd <dest>`，15 秒超时，不会拖慢启动。
+    """
+    dest = _rclone_dest()
+    try:
+        r = subprocess.run(
+            ['rclone', 'lsd', dest, '--max-depth', '1',
+             '--timeout', '15s', '--contimeout', '10s'],
+            capture_output=True, text=True, encoding='utf-8',
+            errors='replace', timeout=30)
+    except FileNotFoundError:
+        return False, 'rclone 未安装或不在 PATH'
+    except subprocess.TimeoutExpired:
+        return False, '连接超时（30s）'
     except Exception as e:
         return False, f'查询失败({type(e).__name__})'
+    if r.returncode == 0:
+        return True, '正常'
+    lines = [x.strip() for x in ((r.stderr or '') + (r.stdout or '')).splitlines() if x.strip()]
+    tail = lines[-1][:80] if lines else f'rc={r.returncode}'
+    return False, f'不可达（{tail}）'
 
 
 def bump_and_get_restarts():
     """记录本次启动，返回 (总次数, 窗口内次数)。
 
-    MIN_COUNT_GAP：调试时可能几分钟内手动重启多次，每次都计数会误报
-    "频繁重启"。所以距上次计数不足 10 分钟时不重复计数。
-    真正的崩溃循环（10 秒重试）间隔远小于 10 分钟，仍能被识别。
+    计数规则（2026-11-16 修，审查报告 R-13）：
+      - 间隔 >= MIN_COUNT_GAP（10 分钟）：正常计数。手动调试重启几次不会误报。
+      - 间隔 <  CRASH_GAP（2 分钟）  ：**照常计数**。这是崩溃循环的特征
+        （进程自己 10 秒后重试），必须立刻累计才能及时告警。
+      - 中间区间（2~10 分钟）：不计数，按人工重启处理。
+
+    旧逻辑是"不足 10 分钟一律不计数"，与它自己的注释
+    「真正的崩溃循环（10 秒重试）间隔远小于 10 分钟，仍能被识别」**矛盾**：
+    10 秒崩溃循环每小时最多只计 6 次，要 20~30 分钟才凑够 3 次阈值，
+    告警严重滞后。改成按间隔分流后，崩溃循环 30 秒内就能触发告警。
     """
     os.makedirs(os.path.dirname(STATE_FILE), exist_ok=True)
     now = time.time()
@@ -85,8 +126,10 @@ def bump_and_get_restarts():
     times = [t for t in (d.get('times') or []) if isinstance(t, (int, float))]
     times = [t for t in times if now - t < 7 * 86400]
     last = times[-1] if times else 0
-    if now - last >= MIN_COUNT_GAP:
+    gap = now - last
+    if gap >= MIN_COUNT_GAP or (last and gap < CRASH_GAP):
         times.append(now)
+        times = times[-MAX_TIMES:]
         try:
             json.dump({'times': times, 'count': len(times), 'last': now},
                       open(STATE_FILE, 'w', encoding='utf-8'),
@@ -104,11 +147,12 @@ def build(task_names=None, task_count=None):
       ✗ 近 24h 录制  -> 删。启动时看它没有行动价值
       ✗ 正在录制     -> 删。启动瞬间必然还没开始录，只会显示"暂无"
       ✓ 主播加载     -> 从"32 个"改成**列出名字**，否则不知道是谁
-      ✓ CD2 状态     -> 留。启动时最该确认的就是"上传通道通不通"
+      ✓ 云端通道     -> 留。启动时最该确认的就是"上传通道通不通"
+                        （2026-11-16 起查 rclone remote 可达性，不再查已下架的 CD2 服务）
       ✓ 磁盘剩余     -> 新增。快满了会导致录制失败，是真实风险
     """
     _, recent = bump_and_get_restarts()
-    ok, cd2_txt = cd2_ok()
+    ok, cloud_txt = cloud_ok()
     # 磁盘剩余：不传路径 = 自动取数据所在盘（原来是写死的 F:\）
     free_gb = disk_free_gb()
     ver = version()
@@ -125,7 +169,7 @@ def build(task_names=None, task_count=None):
         L.append(f'主播加载：{n} 个')
 
     L.append('')
-    L.append('云端通道：CD2 正常' if ok else f'⚠️ 云端通道：CD2 {cd2_txt}')
+    L.append('云端通道：正常' if ok else f'⚠️ 云端通道：{cloud_txt}')
 
     if free_gb is not None:
         if free_gb < DISK_WARN_GB:

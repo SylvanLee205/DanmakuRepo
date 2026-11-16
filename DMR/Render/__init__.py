@@ -8,7 +8,7 @@ from concurrent.futures import ThreadPoolExecutor
 from os.path import join, exists, basename
 from typing import Tuple
 
-from DMR.utils import VideoInfo, DateTimeEncoder, DateTimeDecoder, uuid, PipeMessage
+from DMR.utils import VideoInfo, DateTimeEncoder, DateTimeDecoder, uuid, PipeMessage, FFprobe
 
 
 class Render():
@@ -34,12 +34,64 @@ class Render():
         self.render_executors = ThreadPoolExecutor(max_workers=self.nrenders)
         self._lock = threading.Lock()
 
+    @staticmethod
+    def _video_key(task) -> str:
+        """失败任务的去重键：同一个源视频只保留一条待重试记录。
+
+        2026-11-16：原来只按 uuid 去重，同一个分段反复失败就会在
+        ``.temp/failed_renders.json`` 里堆出多条（实测 16 条里有 5 组重复）。
+        重复条目不仅让 Web 界面的"失败渲染"列表虚高，重启后的重试还会
+        对同一个源视频并发渲染，白占 GPU。Windows 路径大小写不敏感，
+        所以统一走 normcase + abspath。
+        """
+        video = task.get('video') if isinstance(task, dict) else None
+        if isinstance(video, dict):
+            path = video.get('path')
+        else:
+            path = getattr(video, 'path', None)
+        if not path:
+            return ''
+        try:
+            return os.path.normcase(os.path.abspath(str(path)))
+        except OSError:
+            return str(path)
+
+    def _output_looks_complete(self, task, video) -> bool:
+        """产物已存在且时长和源对得上 → 这条"失败"记录其实已经过期。
+
+        为什么需要（2026-11-16）：重启时 reconciler 会用**新 uuid** 补派
+        渲染，成功之后旧失败条目没人清，界面上永远显示"失败"，手工点重试
+        还会白渲一遍。实测 10 条里有 5 条产物已经完整落盘。
+
+        判据沿用渲染闸门：产物时长 ≥ 源可解码时长的 90%。只有 ``output``
+        确实存在时才探测（绝大多数失败条目没有产物，不会付这份开销）。
+        """
+        out = task.get('output')
+        if not out or not os.path.exists(str(out)):
+            return False
+        src = getattr(video, 'path', None)
+        if not src:
+            return False
+        try:
+            out_dur = float(FFprobe.get_duration(out) or 0)
+            if out_dur <= 0:
+                return False
+            src_dur = float(FFprobe.get_media_duration(str(src)) or -1)
+            if src_dur <= 0:
+                return False
+            return out_dur >= src_dur * 0.90
+        except Exception:
+            return False
+
     def load_failed_tasks(self):
         if exists(self.failed_tasks_file):
             try:
                 with open(self.failed_tasks_file, 'r', encoding='utf-8') as f:
                     data = json.load(f, cls=DateTimeDecoder)
                     dropped = 0
+                    duplicated = 0
+                    stale = 0
+                    seen_paths = {}
                     for uuid, task in data.items():
                         if task.get('video'):
                             # ⚠️ 2026-11-03：源视频已不在磁盘上的条目是**僵尸**。
@@ -62,11 +114,31 @@ class Render():
                             # Update config as well
                             # if 'config' in task and 'video' in task['config']:
                             #     task['config']['video'] = task['video']
+                            # 产物已经完整落盘 → 这条失败记录过期（补派成功后的残留）
+                            if self._output_looks_complete(task, task['video']):
+                                stale += 1
+                                continue
+                            # ⚠️ 2026-11-16：同一源视频只留最新一条（json 里
+                            #   越靠后越新），旧条目直接顶掉并落盘。
+                            key = self._video_key(task)
+                            if key:
+                                old = seen_paths.get(key)
+                                if old is not None:
+                                    self.failed_tasks.pop(old, None)
+                                    duplicated += 1
+                                seen_paths[key] = uuid
                         self.failed_tasks[uuid] = task
-                if dropped:
-                    # 立刻落盘，把僵尸从文件里真正抹掉
-                    self.logger.info(f'丢弃 {dropped} 条源视频已不存在的失败渲染记录'
-                                     f'（录播被归档或目录迁移所致）。')
+                if dropped or duplicated or stale:
+                    # 立刻落盘，把僵尸/重复/过期条目从文件里真正抹掉
+                    if dropped:
+                        self.logger.info(f'丢弃 {dropped} 条源视频已不存在的失败渲染记录'
+                                         f'（录播被归档或目录迁移所致）。')
+                    if duplicated:
+                        self.logger.info(f'合并 {duplicated} 条重复的失败渲染记录'
+                                         f'（同一源视频只保留最新一条）。')
+                    if stale:
+                        self.logger.info(f'清理 {stale} 条过期失败记录'
+                                         f'（产物已完整落盘，属补派成功后的残留）。')
                     self.save_failed_tasks()
                 self.logger.info(f'Loaded {len(self.failed_tasks)} failed render tasks.')
             except Exception as e:
@@ -174,6 +246,12 @@ class Render():
         with self._lock:
             self.render_tasks.pop(task['uuid'], None)
             if status == 'error':
+                # 同一源视频只保留最新一条失败记录，避免反复重试堆成一片
+                key = self._video_key(task)
+                if key:
+                    for old_uuid, old_task in list(self.failed_tasks.items()):
+                        if self._video_key(old_task) == key:
+                            self.failed_tasks.pop(old_uuid, None)
                 self.failed_tasks[task['uuid']] = task
                 self.save_failed_tasks()
 
@@ -186,6 +264,19 @@ class Render():
                     data=desc,
                 )
             else:
+                # 同一源视频现在成功了，之前的失败记录就过期了。
+                # 场景：重启时由 reconciler 补派的分段走的是**新 uuid**，
+                # 旧失败条目留在 failed_tasks 里没人清（实测 5 条已经渲染
+                # 成功却仍显示"失败"，手工点重试会白渲一遍）。
+                key = self._video_key(task)
+                if key:
+                    removed = False
+                    for old_uuid, old_task in list(self.failed_tasks.items()):
+                        if self._video_key(old_task) == key:
+                            self.failed_tasks.pop(old_uuid, None)
+                            removed = True
+                    if removed:
+                        self.save_failed_tasks()
                 self._pipeSend(
                     event='end',
                     # 只用文件名，不带 "./直播回放/xxx/" 这种长路径 ——
@@ -254,10 +345,18 @@ class Render():
                 self.logger.warning(f'停止渲染器 {uuid} 时出错: {e}')
         self.render_executors.shutdown(wait=False)
         
+        # 2026-11-16 修（审查报告 L-8）：原来把 render_tasks 里**所有**任务都抄进
+        # failed_tasks，包括正在渲染的。shutdown(wait=False) 不保证它们已停下，
+        # 工作线程可能随后渲染成功；清单里却留下失败记录 → 人工重试白渲一遍，
+        # 若成品已被上传，还会出现"重复渲染同一分段"。
+        # 只收"还没开始"的任务；在跑的交给状态库（RENDERING → 重启对账降级为
+        # RECORDED → 自动恢复或重渲），不做主观判断。
         with self._lock:
-            for uuid, task in self.render_tasks.items():
-                if uuid not in self.failed_tasks:
-                    self.failed_tasks[uuid] = task
+            for task_uuid, task in list(self.render_tasks.items()):
+                if task.get('status') != 'waiting':
+                    continue
+                if task_uuid not in self.failed_tasks:
+                    self.failed_tasks[task_uuid] = task
             self.save_failed_tasks()
 
         self.logger.info('Render stopped.')

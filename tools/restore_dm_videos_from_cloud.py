@@ -12,6 +12,12 @@ import subprocess
 import sys
 import time
 
+try:                                                             # GBK 控制台下 emoji 打印不崩
+    from _guard import ensure_utf8_stdout as _ensure_utf8
+    _ensure_utf8()
+except Exception:                                                # noqa: BLE001
+    pass
+
 
 def _tool(name):
     """定位外部工具：环境变量 -> tools/ -> PATH -> 注册表 PATH -> 安装目录。
@@ -84,7 +90,8 @@ todo = []
 for task, fn, sz in entries:
     if fn in local:
         continue
-    dst_dir = os.path.join(REPLAY, f'{task}（弹幕版）')
+    # 2026-11-16：新布局是 直播回放/弹幕版/<主播>/
+    dst_dir = os.path.join(REPLAY, '弹幕版', task)
     todo.append((task, fn, sz, dst_dir))
 
 total = sum(t[2] for t in todo)

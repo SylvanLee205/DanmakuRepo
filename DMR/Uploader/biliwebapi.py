@@ -291,6 +291,9 @@ class BiliWebApi:
                 is_new = True
             # refreshed is _KEEP_EXISTING -> 保持 self.videos 不变
         if stream_queue is None:
+            # 多文件时 status 必须累积：原实现每次循环覆盖，第 1 个失败、
+            # 最后一个成功 → 整体返回 True → 上游删源，而第 1 个从未上传。
+            status, info = True, ''
             for file in files:
                 status, info = self.upload_file(
                     filepath=file.path,
@@ -298,6 +301,9 @@ class BiliWebApi:
                     videos=self.videos,
                     submit_api='web'
                 )
+                if not status:
+                    logger.error(f'{file.path} 上传失败，中止本组剩余文件。')
+                    break
             # self.submit(submit_api='web', videos=self.videos)
                 
         else:
@@ -533,18 +539,30 @@ class BiliWebApi:
                 futures.append(future)
                 st = time.perf_counter()
 
-                for f in list(futures):
-                    if f.done():
-                        futures.remove(f)
-
-                # 等待所有分片上传完成，并按顺序收集结果
+            # 等全部分片完成并**逐个收集结果**。
+            # 原实现用 `as_completed(futures): pass` 丢弃结果，再按 chunks 数量
+            # 凭空伪造 {"partNumber": i+1, "eTag": "etag"} 去合并 —— 分片重试
+            # 5 次仍失败时 upload_chunk_thread 返回 None，云端的块是缺的，
+            # 但这里照样上报"上传成功"，上层随即删源。必须任一失败即中止。
+            results = []
+            failed = 0
             for future in concurrent.futures.as_completed(futures):
-                pass
+                try:
+                    r = future.result()
+                except Exception as e:                           # noqa: BLE001
+                    logger.error(f'{file_name} 分片上传异常: {e}')
+                    r = None
+                if r is None:
+                    failed += 1
+                else:
+                    results.append(r)
 
-            results = [{
-                "partNumber": i + 1,
-                "eTag": "etag"
-            } for i in range(chunks)]
+            if failed or len(results) != chunks:
+                logger.error(
+                    f'{file_name} 分片上传不完整：成功 {len(results)}/{chunks}，'
+                    f'失败 {failed} 块，放弃本次上传（不提交合并）。')
+                return None
+            results.sort(key=lambda x: x['partNumber'])
             parts.extend(results)
 
         if n == 0:
@@ -700,40 +718,63 @@ class BiliWebApi:
             return None
 
         url = f'https://member.bilibili.com/x/vupre/web/archive/view?bvid={bvid}'
+        # 2026-11-16 修（审查报告 L-18）：原来把**所有**异常都吞掉然后 return None，
+        # 于是 upload() 里那套"取数据异常 → 沿用现有稿件信息"的三态保护成了死代码：
+        # 任何网络抖动/超时都会被解读成"稿件已删除"，紧接着新建稿件 →
+        # upload_group 分裂、合集里出现重复稿件、本地源被误判为已上传。
+        # 现在的语义：
+        #   返回 Data  -> 稿件存在，可复用
+        #   返回 None  -> 接口**明确回答**稿件不存在/不可见
+        #   抛异常     -> 取不到说不上来（网络/解析），交给上层"沿用现有信息"
         try:
-            r = self._session.get(url, timeout=5).json()
-            if r['code'] == 0:
-                data = r['data']
-                info = data['archive']
-                video_data = Data(
-                    bvid=info['bvid'],
-                    copyright=info['copyright'],
-                    source=info['source'],
-                    tid=info['tid'],
-                    cover=info['cover'],
-                    title=info['title'],
-                    desc=info['desc'],
-                    desc_v2=info['desc_v2'],
-                    dynamic=info['dynamic'],
-                    tag=info['tag'],
-                    dtime=info['dtime'],
-                    open_subtitle=data['subtitle']['allow'],
-                    dolby=info['attrs']['is_dolby'],
-                    no_reprint=info['no_reprint'],
-                    is_only_self=info['is_only_self'],
-                    charging_pay=info['charging_pay'],
-                )
-                for video in data['videos']:
-                    video_data.append({
-                        'title': video['title'],
-                        'filename': video['filename'],
-                        'cid': video['cid'],
-                        'desc': '',
-                    })
-                return video_data
+            resp = self._session.get(url, timeout=5)
+            resp.raise_for_status()
+            r = resp.json()
         except Exception as e:
-            logger.error(f'获取远程稿件{bvid}数据失败: {e}')
-        return None
+            raise RuntimeError(f'获取远程稿件{bvid}数据失败(网络): {e}') from e
+
+        code = r.get('code')
+        if code != 0:
+            # 62002=稿件不可见 640404=稿件不存在 -404=未找到
+            if code in (62002, 640404, -404):
+                logger.warning(f'稿件{bvid}不存在或不可见 (code={code})，将新建稿件。')
+                return None
+            # 其余（风控/未登录/未知 code）一律当失败，宁可下次重试，
+            # 也不要因为一次看不懂的返回就重建稿件。
+            raise RuntimeError(
+                f'获取远程稿件{bvid}数据失败: code={code} {r.get("message")}')
+
+        try:
+            data = r['data']
+            info = data['archive']
+            video_data = Data(
+                bvid=info['bvid'],
+                copyright=info['copyright'],
+                source=info['source'],
+                tid=info['tid'],
+                cover=info['cover'],
+                title=info['title'],
+                desc=info['desc'],
+                desc_v2=info['desc_v2'],
+                dynamic=info['dynamic'],
+                tag=info['tag'],
+                dtime=info['dtime'],
+                open_subtitle=data['subtitle']['allow'],
+                dolby=info['attrs']['is_dolby'],
+                no_reprint=info['no_reprint'],
+                is_only_self=info['is_only_self'],
+                charging_pay=info['charging_pay'],
+            )
+            for video in data['videos']:
+                video_data.append({
+                    'title': video['title'],
+                    'filename': video['filename'],
+                    'cid': video['cid'],
+                    'desc': '',
+                })
+            return video_data
+        except Exception as e:
+            raise RuntimeError(f'解析远程稿件{bvid}数据失败: {e}') from e
 
     def submit(self, submit_api=None, videos:'Data'=None):
         edit = videos.bvid is not None

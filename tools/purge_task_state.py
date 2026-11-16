@@ -59,6 +59,8 @@ def main():
     ap = argparse.ArgumentParser(description='清理已停用任务的状态库记录')
     ap.add_argument('names', nargs='*', help='任务名；不给则自动取"库里有、配置里没有"的')
     ap.add_argument('--apply', action='store_true', help='真的写库；不加则只预览')
+    ap.add_argument('--force', action='store_true',
+                    help='允许清理**仍在配置里**的活跃任务（危险，会让该任务状态失明）')
     args = ap.parse_args()
 
     if not os.path.exists(DB):
@@ -86,6 +88,19 @@ def main():
         conn.close()
         return 0
 
+    # ⚠️ 2026-11-16：显式传名时不检查该任务是否仍在 configs/ 里。
+    #    手滑传了活跃主播名 → 它的历史状态全被删（磁盘录像还在，但状态失明：
+    #    已上传的分段会被当成没传过、重新上传/重新渲染）。
+    active = sorted(n for n in targets if n in cfg)
+    if active and not args.force:
+        print('拒绝：以下任务是**仍在配置里**的活跃任务，清理会让它们状态失明：')
+        for n in active:
+            print('   %s' % n)
+        print('如果确实要清：先把配置移到 configs/temp/ 停用，'
+              '或加 --force（不推荐）。')
+        conn.close()
+        return 1
+
     print()
     print('将清理以下任务的状态记录：')
     total = 0
@@ -109,8 +124,25 @@ def main():
         conn.close()
         return 0
 
-    bak = DB + '.bak-' + time.strftime('%Y%m%d-%H%M%S')
-    shutil.copy2(DB, bak)
+    # DMR 运行时会缓存状态，写库后可能被内存里的旧值覆盖回去
+    try:
+        import importlib.util as _ilu
+        _spec = _ilu.spec_from_file_location(
+            '_guard', os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                   '_guard.py'))
+        _g = _ilu.module_from_spec(_spec)
+        _spec.loader.exec_module(_g)
+        if not _g.require_not_running('清理任务状态', force=args.force):
+            conn.close()
+            return 1
+        bak = DB + '.bak-' + time.strftime('%Y%m%d-%H%M%S')
+        if not _g.sqlite_backup(DB, bak):
+            conn.close()
+            return 1
+    except Exception as e:                                       # noqa: BLE001
+        print(f'  [警告] 运行检测/在线备份不可用（{e}），退回直接复制。')
+        bak = DB + '.bak-' + time.strftime('%Y%m%d-%H%M%S')
+        shutil.copy2(DB, bak)
     print()
     print('已备份: %s (%.2f MB)' % (os.path.basename(bak),
                                     os.path.getsize(bak) / 1048576))

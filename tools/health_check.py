@@ -12,6 +12,29 @@ REPLAY = os.path.join(UP, '直播回放')
 SVC = r'C:\Windows\System32\config\systemprofile\Waytech\CloudDrive2'
 
 
+def _iter_task_dirs():
+    """产出 ``(主播名, 源目录, 成品目录)``，新/老两种布局都支持。
+
+    2026-11-16：新布局下 ``直播回放/`` 只有「原视频」「弹幕版」两个容器目录。
+    原来把 REPLAY 的一级子目录当主播目录遍历，于是：
+      · 第 4 节（滞留源文件）扫的是容器目录里的**子目录名**，不是文件 → 恒空
+      · 第 5 节（有源无成品）同样恒空
+    两节都变成"✅ 无"，即假阴性 —— 恰恰在最需要它报警的时候失效。
+    """
+    src_root = os.path.join(REPLAY, '原视频')
+    dm_root = os.path.join(REPLAY, '弹幕版')
+    if os.path.isdir(src_root):
+        for d in sorted(os.listdir(src_root)):
+            s = os.path.join(src_root, d)
+            if os.path.isdir(s):
+                yield d, s, os.path.join(dm_root, d)
+        return
+    for d in sorted(os.listdir(REPLAY)):
+        s = os.path.join(REPLAY, d)
+        if os.path.isdir(s) and not d.endswith('（弹幕版）'):
+            yield d, s, os.path.join(REPLAY, d + '（弹幕版）')
+
+
 def ps(cmd):
     r = subprocess.run(['powershell', '-NoProfile', '-Command', cmd],
                        capture_output=True, text=True, encoding='utf-8', errors='replace')
@@ -40,6 +63,12 @@ print(f'  录制进程: {ps(_sg_q)} 个')
 import shutil
 import sqlite3
 
+try:                                                             # GBK 控制台下 emoji 打印不崩
+    from _guard import ensure_utf8_stdout as _ensure_utf8
+    _ensure_utf8()
+except Exception:                                                # noqa: BLE001
+    pass
+
 dst = os.path.join(os.environ['TEMP'], 'hc_q')
 os.makedirs(dst, exist_ok=True)
 for s in ('', '-wal', '-shm'):
@@ -61,7 +90,7 @@ try:
 except Exception as e:
     print(f'  队列查询失败: {e}')
 
-logs = sorted(glob.glob(os.path.join(UP, 'logs', 'DMR-2026*.log')),
+logs = sorted(glob.glob(os.path.join(UP, 'logs', 'DMR-*.log')),
               key=os.path.getmtime, reverse=True)
 
 print()
@@ -116,10 +145,7 @@ print('=' * 78)
 print('4. 滞留源文件检查')
 print('=' * 78)
 stale = []
-for d in sorted(os.listdir(REPLAY)):
-    sub = os.path.join(REPLAY, d)
-    if not os.path.isdir(sub) or d.endswith('（弹幕版）'):
-        continue
+for d, sub, _dm in _iter_task_dirs():
     for f in os.listdir(sub):
         if f.endswith(('.mkv', '.flv', '.ass')):
             p = os.path.join(sub, f)
@@ -144,11 +170,7 @@ print('=' * 78)
 print('5. 未处理完的分段（有源无弹幕版）')
 print('=' * 78)
 issue = []
-for d in sorted(os.listdir(REPLAY)):
-    sub = os.path.join(REPLAY, d)
-    if not os.path.isdir(sub) or d.endswith('（弹幕版）'):
-        continue
-    dm = os.path.join(REPLAY, d + '（弹幕版）')
+for d, sub, dm in _iter_task_dirs():
     mps = set(os.listdir(dm)) if os.path.isdir(dm) else set()
     for f in os.listdir(sub):
         if not f.endswith('.mkv'):

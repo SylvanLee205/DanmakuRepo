@@ -36,6 +36,12 @@ if PROJ not in sys.path:
 #    （2026-10-19 在 stop_dmr.py 上踩过同样的坑）
 from DMR.paths import powershell_exe  # noqa: E402
 
+try:                                                             # GBK 控制台下 emoji 打印不崩
+    from _guard import ensure_utf8_stdout as _ensure_utf8
+    _ensure_utf8()
+except Exception:                                                # noqa: BLE001
+    pass
+
 #: (桌面显示名, 项目内目标文件, 说明, assets/icons 里的图标名)
 #:
 #: 图标为什么自己生成（tools/make_icons.py）：

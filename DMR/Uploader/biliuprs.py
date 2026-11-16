@@ -122,29 +122,35 @@ class biliuprs():
         else:
             upload_proc = subprocess.Popen(upload_args, stdin=subprocess.PIPE, stdout=logfile, stderr=subprocess.STDOUT)
         
+        # 退出码必须带出去：以前只看日志里有没有 bvid 就判成功，
+        # 于是"超时被杀""上传中途失败但日志已打印 bvid"都会被当成成功，
+        # 上游随即标 uploaded 并在 24 小时后删源 —— 稿件其实不存在。
+        rc = None
         try:
             self._upload_procs[upload_proc.pid] = upload_proc
             if timeout: 
-                upload_proc.wait(timeout=timeout)
+                rc = upload_proc.wait(timeout=timeout)
             else:
-                upload_proc.wait()
+                rc = upload_proc.wait()
         except subprocess.TimeoutExpired:
             self.logger.warning(f'视频{video}上传超时，取消此次上传.')
+            rc = None
         finally:
             upload_proc.kill()
             self._upload_procs.pop(upload_proc.pid)
         
-        return logfile, upload_args
+        return logfile, upload_args, rc
     
     def islogin(self):
         renew_args = self.base_args + ['renew']
         # 临时文件收输出：PIPE + read() 在输出超过管道缓冲时会死锁，
         # 而 bufsize=10**8 解决不了死锁、只白白预留上百 MB 内存。
-        out, _ = run_and_capture_output(renew_args, timeout=60)
-        if 'error' in out.lower():
+        out, rc = run_and_capture_output(renew_args, timeout=60)
+        # 判据按"退出码 + 明确的 error 行"，不用 'error' in out 的子串匹配 ——
+        # 后者会把 "no error" / "error_count: 0" 这类正常输出判成登录失败。
+        if rc != 0:
             return False
-        else:
-            return True
+        return re.search(r'(?im)^\s*(?:error|failed)\b', out or '') is None
 
     def login(self):
         login_args = self.base_args + ['login']
@@ -155,16 +161,14 @@ class biliuprs():
             proc.wait(timeout=120)
             if self.islogin():
                 self.logger.info(f'将 {self.account} 的登录信息保存到 {self.cookies}.')
-                break
-        
+                return
+        # 只有 5 次都失败才报错（原实现放在循环外，成功也会打一条"登录失败"）
         self.logger.error(f'{self.account} 登录失败!.')
 
     def upload_once(self, video, bvid=None, **config):
         with tempfile.TemporaryFile(dir='.temp') as logfile:
-            self.call_biliuprs(video=video, bvid=bvid, logfile=logfile, **config)
-            if self.debug:
-                return True, ''
-        
+            _, _, rc = self.call_biliuprs(video=video, bvid=bvid, logfile=logfile, **config)
+
             out_bvid = None
             log = ''
             logfile.seek(0)
@@ -174,7 +178,14 @@ class biliuprs():
                 if '\"bvid\"' in line:
                     res = re.search(r'(BV[0-9A-Za-z]{10})', line)
                     if res:  out_bvid = res[0]
-        
+
+        # 退出码非 0（含超时被杀，rc 为 None）一律判失败，无论日志里有没有 bvid。
+        if rc != 0:
+            if self.debug and not log:
+                return False, f'退出码 {rc}（debug 模式无日志）'
+            return False, log or f'退出码 {rc}'
+        if self.debug:
+            return True, ''
         if out_bvid:
             return True, out_bvid
         else:
@@ -280,11 +291,19 @@ class biliuprs():
         self.stoped = True
         try:
             if self._upload_procs:
-                self.logger.warninging('上传提前终止，可能需要重新上传.')
-            for _, proc in self._upload_procs.items():
-                proc.kill()
-                out, _ = proc.communicate(timeout=2.0)
-                out = out.decode('utf-8')
-                self.logger.debug(out)
+                # 拼写错误（warninging）会抛 AttributeError，被下面的 except 吞掉，
+                # 结果是"有在传进程时 stop 一个都杀不掉"。且这行必须在 kill 循环之外
+                # 单独保护，不能因为日志失败影响杀进程。
+                try:
+                    self.logger.warning('上传提前终止，可能需要重新上传.')
+                except Exception:                                # noqa: BLE001
+                    pass
+            for _, proc in list(self._upload_procs.items()):
+                try:
+                    proc.kill()
+                    out, _ = proc.communicate(timeout=2.0)
+                    self.logger.debug(out.decode('utf-8', errors='ignore'))
+                except Exception as e:                           # noqa: BLE001
+                    self.logger.debug(f'终止上传进程失败: {e}')
         except Exception as e:
             self.logger.debug(e)

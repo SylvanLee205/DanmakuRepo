@@ -22,6 +22,12 @@ from DMR.Config import Config
 from DMR.Render.dmrender import DmRender
 from DMR.utils import VideoInfo, StreamerInfo
 
+try:                                                             # GBK 控制台下 emoji 打印不崩
+    from _guard import ensure_utf8_stdout as _ensure_utf8
+    _ensure_utf8()
+except Exception:                                                # noqa: BLE001
+    pass
+
 
 cfg = Config('configs/global.yml')
 render_args = cfg.global_config['render_args']['dmrender']

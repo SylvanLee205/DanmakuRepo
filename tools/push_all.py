@@ -27,6 +27,7 @@
 """
 import argparse
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -76,6 +77,89 @@ def sh(cmd, cwd, check=True):
 
 def git(cwd, *args, check=True):
     return sh(['git'] + list(args), cwd, check=check)
+
+
+def git_push(cwd, remote, refspec):
+    """推送并**检查退出码**。
+
+    ⚠️ 2026-11-16 修正（审查报告 S-3）：原实现用 ``git(..., check=False)``，
+    而 ``sh()`` 只返回 stdout —— git push 的结果和错误全在 stderr，于是
+    认证失败 / 网络断 / 非快进时 stdout 为空，照样打印 "ok"、返回 'pushed'，
+    Push_All.bat 显示 "[OK] Both repos up to date"。假成功比明确失败危险。
+    """
+    r = subprocess.run(['git', 'push', remote, refspec], cwd=cwd,
+                       capture_output=True, text=True, encoding='utf-8',
+                       errors='replace')
+    lines = [l for l in ((r.stderr or '') + '\n' + (r.stdout or '')).splitlines()
+             if l.strip()]
+    tail = lines[-1].strip() if lines else ''
+    return r.returncode == 0, tail
+
+
+#: 不允许进公开仓库的敏感模式。命中即要求显式 --allow-sensitive。
+SENSITIVE_PATTERNS = [
+    (re.compile(r'sctp[A-Za-z0-9]{12,}'), 'Server酱 key'),
+    (re.compile(r'https?://100\.(?:1?\d?\d|2[0-4]\d|25[0-5])\.\d{1,3}\.\d{1,3}'),
+     'Tailscale IP'),
+    (re.compile(r'live\.douyin\.com/\d{4,}'), '抖音房间号'),
+    (re.compile(r'live\.bilibili\.com/\d{4,}'), 'B站房间号'),
+    (re.compile(r'(?<!\d)1[3-9]\d{9}(?!\d)'), '手机号'),
+]
+
+#: 只扫这些后缀（二进制文件没有"泄露房间号"的语义）
+_SCAN_SUFFIX = ('.py', '.md', '.yml', '.yaml', '.json', '.txt', '.bat', '.cmd',
+                '.ps1', '.html', '.css', '.js', '.sh', '.toml', '.cfg', '.ini')
+
+#: 第三方 SDK / 压缩库：里面的长数字是协议常量或示例号码，不是我们的隐私。
+#: 扫它们只会制造噪音，让人对告警麻木。
+_SKIP_FILES = {
+    'DMR/LiveAPI/danmaku/douyin/webmssdk.js',
+}
+
+#: 明显的示例占位符 / 测试用假号（文档和单测里本来就该长这样）
+_PLACEHOLDER_IDS = {
+    '123456', '1234567', '12345678', '000000', '111111',
+    # 2026-11-16 把真实房间号脱敏后统一换成的假号，见 docs/maintainer-log.md
+    '123456789012', '10000001', '9999', '111111111', '222222222',
+}
+
+
+def _is_placeholder(frag: str) -> bool:
+    """判断命中的房间号/号码是不是占位符。"""
+    digits = re.sub(r'\D', '', frag)
+    return digits in _PLACEHOLDER_IDS
+
+
+def scan_sensitive():
+    """扫一遍"即将进入公开仓库"的 master 树，返回 [(文件, 行号, 类型, 片段)]。
+
+    为什么要扫：``sync_public`` 用 ``git checkout master -- .`` 整树同步，
+    从不做脱敏检查；而同步过去的 docs 里确实含有真实抖音房间号、Tailscale
+    地址和 B 站房间号（审查报告 S-2 已确认这些内容在 origin/main 上是公开的）。
+    """
+    hits = []
+    files = git(PROD, 'ls-tree', '-r', '--name-only', 'master',
+                check=False).splitlines()
+    for rel in files:
+        rel = rel.replace('\\', '/')
+        if not rel.lower().endswith(_SCAN_SUFFIX) or rel in _SKIP_FILES:
+            continue
+        p = os.path.join(PROD, rel)
+        try:
+            with open(p, encoding='utf-8', errors='replace') as f:
+                text = f.read()
+        except OSError:
+            continue
+        for lineno, line in enumerate(text.splitlines(), 1):
+            for pat, kind in SENSITIVE_PATTERNS:
+                m = pat.search(line)
+                if not m:
+                    continue
+                if _is_placeholder(m.group(0)):
+                    break
+                hits.append((rel, lineno, kind, m.group(0)[:40]))
+                break
+    return hits
 
 
 def master_dirty():
@@ -156,10 +240,10 @@ def sync_public(apply):
     git(WT_PUBLIC, 'add', '-A')
     git(WT_PUBLIC, 'commit', '-q', '-m', subject)
     print('  已提交 %s' % git(WT_PUBLIC, 'log', '-1', '--format=%h %s'))
-    out = git(WT_PUBLIC, 'push', 'origin',
-              '%s:%s' % (PUBLIC_BRANCH, PUBLIC_BRANCH), check=False)
-    print('  push: %s' % (out.splitlines()[-1] if out else 'ok'))
-    return 'pushed'
+    ok, msg = git_push(WT_PUBLIC, 'origin',
+                       '%s:%s' % (PUBLIC_BRANCH, PUBLIC_BRANCH))
+    print('  push: %s' % (msg or ('ok' if ok else '未知错误')))
+    return 'pushed' if ok else 'push_failed'
 
 
 # ---------------------------------------------------------------- 私有仓库
@@ -203,15 +287,18 @@ def sync_full(apply):
     git(WT_FULL, 'add', '-A')
     git(WT_FULL, 'commit', '-q', '-m', '完整副本快照')
     print('  已提交 %s' % git(WT_FULL, 'log', '-1', '--format=%h %s'))
-    out = git(WT_FULL, 'push', FULL_REMOTE,
-              '%s:main' % FULL_BRANCH, check=False)
-    print('  push: %s' % (out.splitlines()[-1] if out else 'ok'))
-    return 'pushed'
+    ok, msg = git_push(WT_FULL, FULL_REMOTE, '%s:main' % FULL_BRANCH)
+    print('  push: %s' % (msg or ('ok' if ok else '未知错误')))
+    return 'pushed' if ok else 'push_failed'
 
 
 def main():
     ap = argparse.ArgumentParser(description='同步并推送两个仓库')
     ap.add_argument('--apply', action='store_true', help='真做（默认只预览）')
+    ap.add_argument('--allow-sensitive', action='store_true',
+                    help='即使扫描到敏感信息（房间号/手机号/key/IP）也继续推送')
+    ap.add_argument('--skip-scan', action='store_true',
+                    help='跳过敏感扫描（不推荐）')
     args = ap.parse_args()
 
     if master_dirty():
@@ -223,6 +310,31 @@ def main():
     print('master HEAD: %s' % head)
     print()
 
+    # ── 公开仓库脱敏闸门（审查报告 S-2）──────────────────────────
+    # 公开仓库是"整树同步"，没有任何脱敏过滤。这里在同步之前扫一遍，
+    # 命中就要求人确认 —— 已经公开出去的内容需要改历史才能清理，所以
+    # "先拦住"比"推完再发现"重要得多。
+    if not args.skip_scan:
+        hits = scan_sensitive()
+        if hits:
+            print('⚠️ 公开仓库将带入 %d 处敏感信息：' % len(hits))
+            for rel, lineno, kind, frag in hits[:20]:
+                print('   %-42s :%-5d %s  %s' % (rel, lineno, kind, frag))
+            if len(hits) > 20:
+                print('   ... 还有 %d 处' % (len(hits) - 20))
+            if not args.allow_sensitive:
+                print()
+                print('已中止。处理方式二选一：')
+                print('  1) 先清理上面这些文件（推荐）')
+                print('  2) 确认可以公开，加 --allow-sensitive 重跑')
+                print('注意：已经推到 origin/main 的内容需要改历史才能清除，'
+                      '光删本地文件不够。')
+                return 2
+            print('（--allow-sensitive 已指定，继续）')
+        else:
+            print('✅ 敏感扫描通过（房间号/手机号/key/内网 IP 均未命中）')
+        print()
+
     pub = sync_public(args.apply)
     full = sync_full(args.apply)
 
@@ -231,6 +343,9 @@ def main():
         print('预览完成。加 --apply 才会提交并推送。')
         return 0
     print('完成：公开=%s  私有=%s' % (pub, full))
+    if 'push_failed' in (pub, full):
+        print('❌ 有仓库推送失败，请看上面的 push 输出。')
+        return 1
     return 0
 
 

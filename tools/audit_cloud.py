@@ -69,6 +69,12 @@ except Exception:
     def safe_remote_name(name):
         return name
 
+# 复用 DMR 的"跳过上传"判定，保证审计与生产语义完全一致（审查报告 L-22）。
+try:
+    from DMR.utils import evaluate_upload_skip_rule
+except Exception:                                                # noqa: BLE001
+    evaluate_upload_skip_rule = None
+
 
 def find_rclone():
     for c in RCLONE_CANDIDATES:
@@ -187,28 +193,36 @@ def should_skip_upload(path, rule):
 
     返回 True = 跳过（不该在云端，审计不应报丢失）。
     ffprobe 失败时**返回 False**（保守：宁可报丢失也不漏报）。
+
+    2026-11-16 修（审查报告 L-22）：改成**直接复用 DMR 的正牌实现**
+    ``DMR.utils.evaluate_upload_skip_rule``，不再自己写第二份。
+    旧实现与生产语义有三处不一致，最要命的一处是：
+    ``skip_require_landscape`` 打开时，DMR 规定「横屏是**必选前置条件、
+    不参与命中计数**」（否则 skip_min_matches=1 就退化成"横屏即跳过"），
+    而旧实现把任意横屏视频都算作"本该跳过" → 横屏视频真的丢了也报不出来，
+    恰好把最该抓到的丢失掩盖掉。
     """
     if not rule or not rule.get('enabled'):
+        return False
+    if evaluate_upload_skip_rule is None:
         return False
     info = probe_video(path)
     if not info:
         return False
-    w, h = info['w'], info['h']
-    if not w or not h:
+    try:
+        from types import SimpleNamespace
+        video = SimpleNamespace(
+            path=path,
+            resolution=(info['w'], info['h']),
+            bitrate=info['kbps'],
+            fps=info['fps'],
+            size=(os.path.getsize(path) if os.path.exists(path) else None),
+            duration=None,
+        )
+        skip, _detail = evaluate_upload_skip_rule(video, rule)
+        return bool(skip)
+    except Exception:                                            # noqa: BLE001
         return False
-    landscape = w > h
-    if rule.get('skip_require_landscape') and not landscape:
-        return False
-    hits = 0
-    if rule.get('skip_landscape') and landscape:
-        hits += 1
-    br = rule.get('skip_bitrate_kbps') or 0
-    if br and info['kbps'] >= br:
-        hits += 1
-    fp = rule.get('skip_fps') or 0
-    if fp and info['fps'] >= fp:
-        hits += 1
-    return hits >= (rule.get('skip_min_matches') or 1)
 
 
 def main():
@@ -326,10 +340,21 @@ def main():
     # 遍历本地任务
     local_tasks = []
     if os.path.isdir(REPLAY):
-        for d in sorted(os.listdir(REPLAY)):
-            full = os.path.join(REPLAY, d)
-            if os.path.isdir(full) and d.endswith('（弹幕版）'):
-                local_tasks.append((d[:-len('（弹幕版）')], full))
+        # 2026-11-16：新布局下成品在 直播回放/弹幕版/<主播>/，容器目录本身
+        # 就叫「弹幕版」。原判据 `d.endswith('（弹幕版）')` 在新布局下恒不命中，
+        # local_tasks 为空 → 审计 0 个任务、永远报"丢失 0"（假阴性）。
+        # 这是检测静默丢失的唯一工具，失效方向恰恰是最危险的。
+        dm_root = os.path.join(REPLAY, '弹幕版')
+        if os.path.isdir(dm_root):
+            for d in sorted(os.listdir(dm_root)):
+                full = os.path.join(dm_root, d)
+                if os.path.isdir(full):
+                    local_tasks.append((d, full))
+        else:
+            for d in sorted(os.listdir(REPLAY)):
+                full = os.path.join(REPLAY, d)
+                if os.path.isdir(full) and d.endswith('（弹幕版）'):
+                    local_tasks.append((d[:-len('（弹幕版）')], full))
 
     if opt.task:
         local_tasks = [x for x in local_tasks if x[0] == opt.task]

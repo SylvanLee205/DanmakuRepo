@@ -72,23 +72,19 @@ class TestEngineStart(DMRTestCase):
         self.assertFalse(engine.stoped)
         self.assertIsNotNone(engine.recv_queue)
 
-    @unittest.expectedFailure
     def test_start_with_preloaded_plugin_is_not_idempotent(self):
-        """已注册插件后再调 ``start()`` 不应崩溃（B7.5）。
+        """已注册插件后再调 ``start()`` 不应崩溃（B7.5，2026-11-16 已修 L-5）。
 
-        ``engine.py:69`` 是 ``for name, plugin in self.plugin_dict.values()``，
-        每次迭代产出的是单个 dict（4 个键），解包成 2 个名字必然
-        ``ValueError: too many values to unpack``；下一行
-        ``self.plugin_dict['name']`` 同样是笔误（写死字符串而非循环变量）。
-
-        正确写法应为 ``.items()`` + ``self.plugin_dict[name]['status']``。
+        原实现是 ``for name, plugin in self.plugin_dict.values()``：每次迭代产出
+        单个 dict（4 个键），解包成 2 个名字必然 ``ValueError``；下一行
+        ``self.plugin_dict['name']`` 又是写死字符串。现改为 ``.items()`` +
+        ``entry['status']``。
         """
         engine = self._make_engine()
         self._register_plugin(engine, "render")
 
         engine.start()  # 修复后此行应通过
 
-    @unittest.expectedFailure
     def test_start_does_not_start_preloaded_plugins_twice(self):
         """修复 B7.5 时，不要重复启动已经 ``add_plugin`` 启动过的插件。
 
@@ -105,9 +101,8 @@ class TestEngineStart(DMRTestCase):
 
         self.assertEqual(plugin.started, 1, "status=1 的插件不应被重复启动")
 
-    @unittest.expectedFailure
     def test_start_with_preloaded_plugin_no_unpack_error(self):
-        """与上例等价的缺陷记录（B7.5），断言"不应抛异常"。"""
+        """与上例等价的缺陷记录（B7.5，已修），断言"不应抛异常"。"""
         engine = self._make_engine()
         self._register_plugin(engine, "render")
 

@@ -41,6 +41,13 @@ class VirtualDownloaderTask:
 
         self.stoped = True
         self.logger = logging.getLogger(__name__)
+        # 2026-11-16 修（审查报告 L-14）：没有"已处理"判重。
+        # start_helper 每 30 秒全量重扫输入目录，源文件只经过 copy2（不移动），
+        # 所以同一个文件会被反复 _pipeSend('livesegment') + sess_videos.append：
+        # 同一段视频被重复渲染/重复上传，sess_videos 无界增长。
+        # 用 (文件名, mtime, size) 做去重键；mtime/size 变化（文件被追加）视作新分段。
+        self._seen = {}
+        self._seg_no = 0
 
     def _pipeSend(self, event, msg, target=None, dtype=None, data=None, **kwargs):
         if self.send_queue:
@@ -77,19 +84,27 @@ class VirtualDownloaderTask:
             if mtime > time.time() - self.segment_wait_time:
                 continue
 
+            # 判重：同一份文件（内容未变）只派发一次（L-14）
+            size_raw = getsize(file_path)
+            dedup_key = (file, int(mtime), size_raw)
+            if dedup_key in self._seen:
+                continue
+            self._seen[dedup_key] = True
+
             width, height = FFprobe.get_resolution(file_path)
             if not (width and height):
                 default_resolution = self.advanced_video_args.get('default_resolution', (1920, 1080))
                 self.logger.warning(f'无法获取视频大小，使用默认值 {default_resolution}.')
                 width, height = default_resolution
 
+            self._seg_no += 1
             video_info = VideoInfo(
                 file_id=uuid(),
                 dtype='src_video',
                 path=file_path,
                 group_id=self.sess_id,
-                segment_id=len(self.sess_videos) + 1,
-                size=getsize(file_path),
+                segment_id=self._seg_no,
+                size=size_raw,
                 ctime=ctime,
                 duration=mtime-ctime,
                 resolution=(width, height),
@@ -139,9 +154,9 @@ class VirtualDownloaderTask:
                 output_file = join(self.output_dir, file)
                 if not exists(self.output_dir):
                     os.makedirs(self.output_dir, exist_ok=True)
-                if exists(output_file):
-                    cnt = len(glob.glob(splitext(output_file)[0] + '*'))
-                    output_file = splitext(output_file)[0] + f'({cnt})' + splitext(output_file)[1]
+                # 2026-11-16 修（L-10 同型）：copy2 会覆盖同名成品，
+                # 改用安全命名（glob 未转义 + 数个数不等于找空位）。
+                output_file = safe_filename(output_file)
                 shutil.copy2(file_path, output_file)
                 video_info.path = output_file
 
@@ -172,6 +187,8 @@ class VirtualDownloaderTask:
         self.start_time = self.start_time or time.time()
         self.sess_id = uuid(8)
         self.sess_videos = []
+        self._seen = {}
+        self._seg_no = 0
 
         while not self.stoped:
             try:
@@ -183,6 +200,8 @@ class VirtualDownloaderTask:
                     self.start_time = time.time()
                     self.sess_id = uuid(8)
                     self.sess_videos = []
+                    self._seen = {}
+                    self._seg_no = 0
                     self._pipeSend('liveend', '直播结束', dtype='str', data=self.sess_id)
                 
                 if self.onair:

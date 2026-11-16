@@ -502,6 +502,12 @@ class StreamDownloadTask():
                                      height=self.height,
                                      advanced_dm_args=self.advanced_dm_args,
                                      **self.kwargs)
+            # 2026-11-16 修（审查报告 L-17）：线程从提交到真正跑起来之间可能
+            # 已经被 stop_once() 停过（stop 时 dmw 还是 None，stop 不到它）。
+            # 这时再 start() 会留下一个没人收的弹幕下载器。
+            if self.stoped:
+                self.logger.debug(f'{self.taskname}: 已停止，跳过弹幕线程启动。')
+                return
             self.dmw.start(self_segment=not self.video)
         
         def video_thread():
@@ -522,6 +528,13 @@ class StreamDownloadTask():
             )
             # 录制开始后，后台从本地分段补探真实分辨率（不碰网络、不碰风控）
             self._start_resolution_probe()
+            # 2026-11-16 修（审查报告 L-17）：这里原来无条件 self.downloader.start()。
+            # stop_once() 在 downloader 还是 None 的时候停不到它，随后本线程照常
+            # 构造并 start()，而各 downloader 的 start 会把**自己的** stoped 置
+            # False → 留下一个持续录制、永远没人 stop 的孤儿 ffmpeg。
+            if self.stoped:
+                self.logger.debug(f'{self.taskname}: 已停止，跳过视频线程启动。')
+                return
             self.downloader.start()
 
         self.executor = ThreadPoolExecutor(max_workers=int(self.danmaku) + int(self.video))
@@ -710,14 +723,18 @@ class StreamDownloadTask():
 
     def stop_once(self):
         self.stoped = True
-        if self.video and hasattr(self, 'downloader'):
+        # L-17 顺带：downloader / dmw 在 start_once 里被先置 None 再建实例，
+        # 原来用 hasattr 判断（属性存在但值是 None）会 AttributeError。
+        _dl = getattr(self, 'downloader', None)
+        if self.video and _dl is not None:
             try:
-                self.downloader.stop()
+                _dl.stop()
             except Exception as e:
                 self.logger.exception(e)
-        if self.danmaku and hasattr(self, 'dmw') and self.dmw:
+        _dmw = getattr(self, 'dmw', None)
+        if self.danmaku and _dmw is not None:
             try:
-                self.dmw.stop()
+                _dmw.stop()
             except Exception as e:
                 self.logger.exception(e)
         try:

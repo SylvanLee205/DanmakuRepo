@@ -133,10 +133,17 @@ def main():
         con.close()
         return 0
 
-    # ── 备份 ──
+    # ── 备份（在线备份 API：活库也拿一致性快照，copy2 可能拿到半页）──
     stamp = time.strftime('%Y%m%d-%H%M%S')
     bak = f'{opt.db}.bak-{stamp}'
-    shutil.copy2(opt.db, bak)
+    _bak_ok = False
+    try:
+        from _guard import sqlite_backup
+        _bak_ok = sqlite_backup(opt.db, bak)
+    except Exception:                                            # noqa: BLE001
+        pass
+    if not _bak_ok:
+        shutil.copy2(opt.db, bak)
     print(f'  已备份状态库 → {bak}')
 
     now = int(time.time())

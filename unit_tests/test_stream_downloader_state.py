@@ -533,7 +533,7 @@ class TestInProgressDetection(_TaskTestCase):
         ).reconcile()
 
         self.assertEqual(self.repo.get_artifact('sess-1:src_video:1').state,
-                         ArtifactState.SKIPPED)
+                         ArtifactState.FAILED)
         self.assertFalse(os.path.exists(part), "discard 应删除残file")
 
     def test_unrenamed_file_is_recovered_not_discarded(self):

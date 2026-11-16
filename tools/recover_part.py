@@ -42,6 +42,12 @@ import time
 from datetime import datetime
 from os.path import basename, dirname, exists, isfile, join, splitext
 
+try:                                                             # GBK 控制台下 emoji 打印不崩
+    from _guard import ensure_utf8_stdout as _ensure_utf8
+    _ensure_utf8()
+except Exception:                                                # noqa: BLE001
+    pass
+
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, ROOT)
 
@@ -455,7 +461,19 @@ def recover_all(cfg=None, min_age_minutes=DEFAULT_MIN_AGE_MINUTES,
             if not exists(dm):
                 L(f'  跳过 {basename(vf)}: 没有配套 .ass')
                 continue
-            out_dir = dirname(vf) + '（弹幕版）'
+            # 2026-11-16：新布局下源在 直播回放/原视频/<主播>/，成品必须落在
+            # 直播回放/弹幕版/<主播>/。原来用 dirname(vf)+'（弹幕版）'，成品会
+            # 渲进 原视频/<主播>（弹幕版）/，build_index 和状态库都对不上。
+            try:
+                from DMR.paths import danmaku_dir_for
+                out_dir = danmaku_dir_for(vf)
+            except Exception:
+                _d = dirname(vf)
+                if os.path.basename(os.path.dirname(_d)) == '原视频':
+                    out_dir = os.path.join(os.path.dirname(os.path.dirname(_d)),
+                                           '弹幕版', os.path.basename(_d))
+                else:
+                    out_dir = _d + '（弹幕版）'
             os.makedirs(out_dir, exist_ok=True)
             out = join(out_dir, splitext(basename(vf))[0] + f'（弹幕版）.{out_fmt}')
             # 记住渲染产物的任务名（上传时用）

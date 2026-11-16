@@ -41,8 +41,14 @@ class DanmakuDownloader():
         self.dm_file_min_time = self.advanced_dm_args.get('dm_file_min_time', 10)
 
         self.dm_filter = dm_filter.copy() if dm_filter else {}
+        # 2026-11-16 修（审查报告 L-9）：这两个变量原来只在 try 里赋值，
+        # 一旦取 dm_filter['keywords'] 就抛异常（dm_filter 为 None / 缺键），
+        # except 里那条 warning 的 f-string 又会引用它 → UnboundLocalError
+        # 直接顶出来，DanmakuDownloader 构造失败 → 整场录不上弹幕。
+        # 现在先初始化，并改成 .get() 取值，缺键就是"没配屏蔽词"。
+        keywords_filter = []
         try:
-            keywords_filter = dm_filter['keywords']
+            keywords_filter = self.dm_filter.get('keywords')
             if not keywords_filter:
                 keywords_filter = []
             elif isinstance(keywords_filter, str):
@@ -57,8 +63,9 @@ class DanmakuDownloader():
             self.logger.warning(f'弹幕屏蔽词{keywords_filter}设置错误:{e}，此功能将不会生效.')
             self.dm_filter['keywords'] = []
         
+        username_filter = []
         try:
-            username_filter = dm_filter['username']
+            username_filter = self.dm_filter.get('username')
             if not username_filter:
                 username_filter = []
             elif isinstance(username_filter, str):

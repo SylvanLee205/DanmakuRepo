@@ -16,6 +16,51 @@ from DMR.utils import FFprobe, isvideo, VideoInfo, is_danmaku_xml, find_danmaku_
 from DMR.Render import Render
 
 
+def _safe_duration(path: str) -> float:
+    """读可解码时长，失败一律返回 -1（永不抛异常、永不返回 None）。
+
+    2026-11-16（审查报告 L-4）：下游要用它做算术判断，必须保证拿到的是数字。
+    用 ``get_media_duration``（按 packet 累加，对分段/flv 更可靠），
+    拿不到再退回 ``get_duration``（容器级信息）。
+    """
+    for getter in (getattr(FFprobe, 'get_media_duration', None),
+                   getattr(FFprobe, 'get_duration', None)):
+        if getter is None:
+            continue
+        try:
+            d = getter(path)
+            d = float(d)
+        except Exception:                                        # noqa: BLE001
+            continue
+        if d > 0:
+            return d
+    return -1.0
+
+
+def _interactive() -> bool:
+    """当前是否有人能按键。
+
+    2026-11-16：本脚本原来有 4 处裸 ``input()``。被计划任务/管道调用时
+    没有控制台，``input()`` 要么抛 EOFError 崩掉，要么（有控制台但无人
+    值守时）永久挂住 —— 无人值守链路上不允许任何阻塞式输入。
+    """
+    try:
+        return sys.stdin is not None and sys.stdin.isatty()
+    except Exception:                                            # noqa: BLE001
+        return False
+
+
+def _ask(prompt: str = '', default: str = '') -> str:
+    """交互时提问，非交互时直接取默认值。"""
+    if not _interactive():
+        print(f'{prompt}（非交互环境，使用默认值）')
+        return default
+    try:
+        return input(prompt)
+    except EOFError:
+        return default
+
+
 def main():    
     parser = argparse.ArgumentParser()
     parser.add_argument('--config', default='configs/global.yml')
@@ -37,7 +82,7 @@ def main():
     logging.getLogger().addHandler(console_handler)
 
     input_dir = args.input_dir if args.input_dir else config.global_config.get('downloader_args', {}).get('output_dir', '直播回放')
-    inp = input(f"请输入视频文件夹路径 (回车使用默认路径 {input_dir}): \n")
+    inp = _ask(f"请输入视频文件夹路径 (回车使用默认路径 {input_dir}): \n")
     if inp: input_dir = inp
 
     print(f'即将对文件夹 {input_dir} 下的视频进行渲染')
@@ -73,12 +118,24 @@ def main():
         os.makedirs(output_dir,exist_ok=True)
         output = join(output_dir,filename)
 
-        if exists(output) and FFprobe.get_duration(output) - FFprobe.get_duration(vname) < 30:
-            ignores.append({
-                'video': vname,
-                'msg': f'视频 {vname} 已经存在带弹幕视频 {output}，跳过渲染.',
-                })
-            continue
+        # 2026-11-16 修（审查报告 L-4）：原来是
+        #     if exists(output) and FFprobe.get_duration(output) - \
+        #             FFprobe.get_duration(vname) < 30:
+        # 探测失败时 get_duration 返回 **-1**，于是：
+        #   · 成品坏(-1)、源也读不出(-1) → -1-(-1)=0 < 30 → 判定"已有成品"跳过；
+        #   · 成品坏(-1)、源正常(3600)   → -3601 < 30      → 同样跳过。
+        # 结果是一份坏掉的弹幕版永远挡着重渲染。现在任一 duration<=0 都必须重渲。
+        if exists(output):
+            _d_out = _safe_duration(output)
+            _d_src = _safe_duration(vname)
+            if _d_out > 0 and _d_src > 0 and _d_out - _d_src < 30:
+                ignores.append({
+                    'video': vname,
+                    'msg': f'视频 {vname} 已经存在带弹幕视频 {output}，跳过渲染.',
+                    })
+                continue
+            if _d_out <= 0:
+                print(f'  成品 {os.path.basename(output)} 读不出时长（可能上次渲染被中断），将重新渲染。')
 
         if mode == 'dmrender' and not danmu:
             ignores.append({
@@ -107,7 +164,7 @@ def main():
     print('如果视频被错误分类，请清理文件夹后重试')
     print('如果想选择特定的视频，请输入视频编号，例如：0 2 5')
     print('或者直接回车开始全部渲染：')
-    inp = input()
+    inp = _ask()
     task_idx = range(len(tasks))
     if inp:
         task_idx = [int(x) for x in inp.split(' ')]
@@ -142,7 +199,7 @@ def main():
 if __name__ == '__main__':
     try:
         main()
-        input('渲染完成.')
+        _ask('渲染完成.')
     except Exception as e:
         logging.exception(e)
-        input(f'渲染错误, {e}')
+        _ask(f'渲染错误, {e}')

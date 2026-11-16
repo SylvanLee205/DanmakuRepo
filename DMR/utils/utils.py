@@ -145,6 +145,31 @@ def retry_safe(func, max_retries=5, sleep_interval=1):
             time.sleep(sleep_interval)
     return None
 
+def _free_name(path: str, limit: int = 1000) -> str:
+    """给 path 找一个当前不存在的名字（不覆盖任何已有文件）。
+
+    2026-11-16 修（审查报告 L-10）：原来是
+        cnt = len(glob.glob(splitext(f)[0] + '*'))
+        f = splitext(f)[0] + f'({cnt})' + splitext(f)[1]
+    两个硬伤：
+      ① glob 没转义：标题里的 `[1]` / `?` / `*` 会被当通配符。
+         `标题[1].mp4` 拼出的 pattern 是 `标题[1]*`，`[1]` 是字符类"1"，
+         一个文件都匹配不到 → 数出 0 → 返回的还是那个**已存在**的名字。
+      ② "数个数"不等于"找空位"：删过文件后 (0)(2) 并存时数出 2，又会撞。
+    实测后果：弹幕版渲染用 -y，撞名就直接覆盖了已有成品（违反红线）。
+    现在逐个候选名做 exists() 探测（不依赖 glob），找到第一个空的就用。
+    """
+    if not exists(path):
+        return path
+    base, ext = splitext(path)
+    for i in range(limit):
+        cand = f'{base}({i}){ext}'
+        if not exists(cand):
+            return cand
+    # 极端情况（同名文件多到 limit 个）：退回时间戳，仍然保证不覆盖
+    return f'{base}({int(time.time())}){ext}'
+
+
 def rename_safe(src:str, dst:str, retry:int=10):
     dst:str = dst
     retry = max(1, int(retry))
@@ -152,9 +177,7 @@ def rename_safe(src:str, dst:str, retry:int=10):
     if not exists(src):
         return False
 
-    if exists(dst):
-        cnt = len(glob.glob(splitext(dst)[0] + '*'))
-        dst = splitext(dst)[0] + f'({cnt})' + splitext(dst)[1]
+    dst = _free_name(dst)
     
     while retry_cnt < retry:
         try:
@@ -169,13 +192,7 @@ def rename_safe(src:str, dst:str, retry:int=10):
     return False
 
 def safe_filename(filename:str) -> str:
-    if not exists(filename):
-        return filename
-
-    if exists(filename):
-        cnt = len(glob.glob(splitext(filename)[0] + '*'))
-        filename = splitext(filename)[0] + f'({cnt})' + splitext(filename)[1]
-    return filename
+    return _free_name(filename)
 
 def isvideo(path: str) -> bool:
     ext = path.split('.')[-1]

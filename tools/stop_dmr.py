@@ -81,7 +81,7 @@ except Exception:
 def _iter_procs():
     """遍历进程，容忍进程在遍历途中退出。"""
     try:
-        return list(psutil.process_iter(['pid', 'name', 'cmdline']))
+        return list(psutil.process_iter(['pid', 'name', 'cmdline', 'cwd']))
     except Exception:
         return []
 
@@ -90,18 +90,50 @@ def _cmdline_has(cmdline, needle):
     return any(needle in (a or '') for a in (cmdline or []))
 
 
+def _owns_project(proc) -> bool:
+    """进程是不是**本项目**的。
+
+    2026-11-16：原判据是 ``any('main.py' in arg)``，而
+    ``'main.py' in 'domain.py'`` 也是 True —— 机器上只要跑着任何别的
+    Python 项目，``stop_dmr --force`` 就可能把无关进程杀掉。
+    判据改成：命令行里出现项目根目录，或进程 cwd 就是项目根。
+    """
+    try:
+        root = os.path.normcase(os.path.abspath(UP))
+        cmdline = proc.info.get('cmdline') or []
+        joined = os.path.normcase(' '.join(str(a) for a in cmdline))
+        if root in joined:
+            return True
+        cwd = proc.info.get('cwd')
+        return bool(cwd) and os.path.normcase(os.path.abspath(cwd)) == root
+    except Exception:                                            # noqa: BLE001
+        return False
+
+
+def _is_script(proc, script: str) -> bool:
+    """命令行里是否**以参数形式**跑了某个脚本（按 basename 精确比对）。"""
+    try:
+        cmdline = proc.info.get('cmdline') or []
+        return any(os.path.basename(str(a)).lower() == script.lower()
+                   for a in cmdline[1:])
+    except Exception:                                            # noqa: BLE001
+        return False
+
+
 def pids_cmd():
     """守护循环的 cmd（命令行里含 Start_Render）。"""
     return [p.info['pid'] for p in _iter_procs()
             if (p.info['name'] or '').lower() == 'cmd.exe'
-            and _cmdline_has(p.info['cmdline'], 'Start_Render')]
+            and _cmdline_has(p.info['cmdline'], 'Start_Render')
+            and _owns_project(p)]
 
 
 def pids_dmr():
-    """DMR 主进程（python 跑 main.py）。"""
+    """DMR 主进程（python 跑 main.py），且必须属于本项目。"""
     return [p.info['pid'] for p in _iter_procs()
             if (p.info['name'] or '').lower() == 'python.exe'
-            and _cmdline_has(p.info['cmdline'], 'main.py')]
+            and _is_script(p, 'main.py')
+            and _owns_project(p)]
 
 
 def pids_sg():

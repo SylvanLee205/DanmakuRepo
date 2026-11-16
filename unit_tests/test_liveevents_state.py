@@ -501,5 +501,90 @@ class TestTaskErrorPersistence(_SyncTestCase):
                          "failed", "内存状态仍应被收敛为 failed")
 
 
+
+class TestSettleExistingProduct(_SyncTestCase):
+    """「成品已在磁盘、但库里没有记录」的收敛（2026-11-16 实测缺口）。
+
+    背景：DMR 连续运行 7 天期间状态库一条 session 都没写进去，于是那几天
+    渲染完、并且**已经成功上传**的成品在库里没有 dm_video 记录。原来
+    ``_dispatch_pending_renders`` 见到成品已存在就 ``continue``，既不补记也不
+    补传 —— 每次重启都重新判成"待恢复"，日志永远停在
+    「发现 N 个待恢复产物 → 已重新派发 0 个任务」。
+    """
+
+    def _events(self, *, journal=None):
+        events = self.make_events(
+            common_event_args={"auto_render": True, "auto_upload": False,
+                               "auto_clean": False, "auto_transcode": False},
+            render_args={"dmrender": {"output_dir": self.tmpdir, "format": "mp4"}},
+        )
+        events.state_repo = self.repo
+        events._pending_clean_path = self.path("pending_clean.json")
+        if journal is not None:
+            import json as _json
+            with open(events._pending_clean_path, "w", encoding="utf-8") as f:
+                _json.dump(journal, f, ensure_ascii=False)
+        return events
+
+    def _journal(self, src_name):
+        return [{"id": "x", "due_ts": 0, "pairs": [[src_name, src_name[:-3] + ".ass"]]}]
+
+    def test_confirmed_by_clean_journal_marks_uploaded(self):
+        """待删清单里有这一场 → 上传早已确认，直接标 UPLOADED，不重传。"""
+        src = self.path("主播-2026年11月15日17点18分.ts")
+        product = self.path("主播-2026年11月15日17点18分（弹幕版）.mp4")
+        open(product, "wb").close()
+        events = self._events(journal=self._journal(os.path.basename(src)))
+
+        events._settle_existing_product("g1", "dm_video", 0, product)
+
+        artifact = self.artifact("g1", ArtifactKind.DANMAKU_VIDEO, 1)
+        self.assertIsNotNone(artifact)
+        self.assertEqual(artifact.state, ArtifactState.UPLOADED)
+
+    def test_no_journal_entry_falls_back_to_rendered(self):
+        """没有上传证据 → 只补记 RENDERED，交回上传流程（不假装已上传）。"""
+        product = self.path("主播-2026年11月16日06点56分（弹幕版）.mp4")
+        open(product, "wb").close()
+        events = self._events(journal=[])
+
+        events._settle_existing_product("g1", "dm_video", 0, product)
+
+        artifact = self.artifact("g1", ArtifactKind.DANMAKU_VIDEO, 1)
+        self.assertEqual(artifact.state, ArtifactState.RENDERED)
+
+    def test_dispatch_records_existing_product_instead_of_silently_skipping(self):
+        """集成：成品已存在时不得再派渲染，但必须把状态收敛掉。
+
+        这条用例专门覆盖 2026-11-16 引入的 ``NameError: vtype`` ——
+        ``_dispatch_pending_renders`` 里并没有 ``vtype`` 变量。
+        """
+        src = self.path("主播-2026年11月15日18点18分.ts")
+        open(src, "wb").close()
+        ass = src[:-3] + ".ass"
+        open(ass, "wb").close()
+        product = self.path("主播-2026年11月15日18点18分（弹幕版）.mp4")
+        open(product, "wb").close()
+        events = self._events(journal=self._journal(os.path.basename(src)))
+        video = self.make_video(src, segment_id=1, group_id="g1", dm_file_id=ass)
+        events.state_dict["g1"] = [{
+            "src_video": {"status": "ready", "file": video, "wait": [], "segment_id": 1},
+            "src_video_pre": {"status": None, "file": None, "wait": [], "segment_id": None},
+            "dm_video": {"status": None, "file": None, "wait": [], "segment_id": None},
+        }]
+
+        messages = events._dispatch_pending_renders("g1")
+
+        self.assertEqual(messages, [], "成品已存在时不应再派渲染任务")
+        artifact = self.artifact("g1", ArtifactKind.DANMAKU_VIDEO, 1)
+        self.assertIsNotNone(artifact, "必须补记 dm_video 产物，否则每次重启都重复'待恢复'")
+        self.assertEqual(artifact.state, ArtifactState.UPLOADED)
+        self.assertEqual(events.state_dict["g1"][0]["dm_video"]["status"], "uploaded")
+        # 源槽位也必须收敛，否则它仍是 RECORDED，下次重启会再次被 resume 选中
+        self.assertEqual(events.state_dict["g1"][0]["src_video"]["status"], "uploaded")
+        self.assertEqual(self.artifact("g1", ArtifactKind.SOURCE, 1).state,
+                         ArtifactState.UPLOADED)
+
+
 if __name__ == "__main__":
     unittest.main()

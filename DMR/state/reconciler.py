@@ -350,7 +350,10 @@ class RecoveryManager:
             target = transitions[artifact.state]
             self.repo.set_artifact_state(
                 artifact.artifact_id, target,
-                last_error=None if target is ArtifactState.RECORDED
+                # 回到 RECORDED 表示"这次没出错"，把上次遗留的错误清掉；
+                # ⚠️ 现在 set_artifact_state 把 last_error=None 视为"不改动"，
+                # 清空必须显式传空串（2026-11-16 L-7）。
+                last_error="" if target is ArtifactState.RECORDED
                 else "进程退出时仍在运行",
             )
             report.unstable.append(
@@ -467,8 +470,11 @@ class RecoveryManager:
         action = self.config.on_interrupted_file
         if action is InterruptedFileAction.DISCARD:
             self._safe_remove(target)
+            # ⚠️ 2026-11-16：这里不能写 SKIPPED —— 清理闸门把 SKIPPED 当作
+            #    "命中跳过上传规则、可以删源"，而中断产物被丢弃时源可能是
+            #    唯一副本。用 FAILED（同为终态、同样不自动重试，但不在清理白名单里）。
             self.repo.set_artifact_state(artifact.artifact_id,
-                                         ArtifactState.SKIPPED,
+                                         ArtifactState.FAILED,
                                          last_error="文件校验未通过，已删除")
             report.interrupted.append(
                 InterruptedAction(artifact.artifact_id, target, "discarded")
@@ -494,8 +500,9 @@ class RecoveryManager:
 
         if action is InterruptedFileAction.DISCARD:
             self._safe_remove(part)
+            # 同上：丢弃 ≠ 按规则跳过上传，不能落 SKIPPED（见 D-11）
             self.repo.set_artifact_state(
-                artifact.artifact_id, ArtifactState.SKIPPED,
+                artifact.artifact_id, ArtifactState.FAILED,
                 last_error="用户配置为丢弃中断产物",
             )
             report.interrupted.append(
@@ -565,8 +572,9 @@ class RecoveryManager:
                 age = now - artifact.updated_at
                 if age <= stale_after:
                     continue
+                # 同上：过期抛弃不是"按规则跳过上传"，落 FAILED 更安全
                 self.repo.set_artifact_state(
-                    artifact.artifact_id, ArtifactState.SKIPPED,
+                    artifact.artifact_id, ArtifactState.FAILED,
                     last_error=f"超过 {stale_after}s 无进展，已抛弃",
                 )
                 report.stale.append(StaleAction(artifact.artifact_id, age))

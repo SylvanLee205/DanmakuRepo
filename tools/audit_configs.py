@@ -81,6 +81,12 @@ import logging
 logging.basicConfig(level=logging.ERROR)
 from DMR.Config import Config
 
+try:                                                             # GBK 控制台下 emoji 打印不崩
+    from _guard import ensure_utf8_stdout as _ensure_utf8
+    _ensure_utf8()
+except Exception:                                                # noqa: BLE001
+    pass
+
 cfg = Config('configs/global.yml')
 bad = []
 for r in sorted(rows, key=lambda x: x['task']):

@@ -41,6 +41,12 @@ import time
 from datetime import datetime
 from os.path import basename, dirname, exists, join
 
+try:                                                             # GBK 控制台下 emoji 打印不崩
+    from _guard import ensure_utf8_stdout as _ensure_utf8
+    _ensure_utf8()
+except Exception:                                                # noqa: BLE001
+    pass
+
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, ROOT)
 
@@ -139,13 +145,30 @@ def render_final_name(template, streamer, dt):
         return None
 
 
-def find_danmaku(seg_path, token14):
+def _token14_of(name):
+    """从文件名里取出第一个 14 位时间戳（YYYYMMDDHHMMSS），拿不到返回 None。"""
+    try:
+        for run in re.findall(r'\d{14}', name):
+            try:
+                return datetime.strptime(run, '%Y%m%d%H%M%S')
+            except ValueError:
+                continue
+    except Exception:
+        pass
+    return None
+
+
+def find_danmaku(seg_path, token14, part_idx=None, tolerance_sec=300):
     """在分段同目录里找配对的 .ass / .xml。
 
-    优先用 14 位时间戳（YYYYMMDDHHMMSS）匹配：
-      ffmpeg 分段：...-20261018-231500-Part000.ts  → 20261018231500
-      弹幕文件   ：[正在录制]主播-20261018-231500-Part000.ass → 同一 token
-    也接受 biliup 风格的 14 位连续数字。
+    配对规则（2026-11-16 重写，审查报告 L-11）：
+
+      1. **时间戳必须对得上**，允许 ±tolerance_sec（默认 300s）的偏差。
+         弹幕录制与视频录制是两条独立进程，时间戳差 1~2 秒是常态；
+         旧实现要求"14 位数字串完全相等"，差 1 秒就配不上，直接漏配。
+      2. 时间戳也靠得住的候选里，**优先 Part 序号精确相同的那个**。
+         旧实现按"文件名最短"排序取第一个，于是 Part001.ts 永远配到
+         Part000.ass，还会把 Part000 的弹幕 move 走（Part000 从此没弹幕）。
     """
     d = dirname(seg_path)
     cands = []
@@ -155,16 +178,30 @@ def find_danmaku(seg_path, token14):
         cands += glob.glob(join(d, '*' + ext))
     if not token14:
         return None
-    hits = []
-    for c in cands:
-        digits = ''.join(ch for ch in basename(c) if ch.isdigit())
-        if token14 in digits:
-            hits.append(c)
-    if not hits:
+    target = _token14_of(str(token14))
+    if target is None:
         return None
-    # 同时间戳可能有多个（Part000/Part001），取文件名最短的（最可能对应首个分段）
-    hits.sort(key=lambda p: (len(basename(p)), p))
-    return hits[0]
+
+    want_part = None if part_idx is None else f'Part{int(part_idx):03d}'
+    scored = []
+    for c in cands:
+        name = basename(c)
+        ts = _token14_of(name)
+        if ts is None:
+            continue
+        try:
+            delta = abs((ts - target).total_seconds())
+        except Exception:
+            continue
+        if delta > tolerance_sec:
+            continue
+        # (Part 是否精确匹配, 时间差, 名字长度)：越小越优先
+        part_rank = 0 if (want_part is None or want_part in name) else 1
+        scored.append((part_rank, delta, len(name), c))
+    if not scored:
+        return None
+    scored.sort()
+    return scored[0][3]
 
 
 def scan(cfg, replay_dir=None, min_age_minutes=DEFAULT_MIN_AGE_MINUTES,
@@ -256,7 +293,7 @@ def scan(cfg, replay_dir=None, min_age_minutes=DEFAULT_MIN_AGE_MINUTES,
             L(f'  跳过（目标已存在）: {basename(dst)}')
             continue
 
-        dm = find_danmaku(p, token14)
+        dm = find_danmaku(p, token14, part_idx=_idx)
         out.append({
             'src': p, 'dst': dst, 'danmaku': dm, 'task': task,
             'size': st.st_size, 'desc': desc, 'token': token14,
@@ -310,7 +347,11 @@ def recover_all(cfg, min_age_minutes=DEFAULT_MIN_AGE_MINUTES, apply_changes=True
             L(f'  [dry-run] {basename(it["src"])} -> {basename(it["dst"])}')
         return result
     ok_n, failed = apply(items, logger=logger)
-    result['recovered'] = [it['dst'] for it in items]
+    # 2026-11-16 修（审查报告 L-11）：原来这里直接把 items 里**全部** dst 当成
+    # 已恢复，失败的那些也算"恢复成功" —— 调用方（main.py）会拿它们去声称
+    # "已恢复 N 个分段"，实际文件还叫 [正在录制]xxx。现在只收真正改名成功的。
+    failed_srcs = {src for src, _ in failed}
+    result['recovered'] = [it['dst'] for it in items if it['src'] not in failed_srcs]
     result['failed'] = failed
     L(f'  ffmpeg 分段恢复完成：{ok_n} 成功 / {len(failed)} 失败')
     return result

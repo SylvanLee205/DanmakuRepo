@@ -1,11 +1,28 @@
 import logging
 import queue
 import subprocess
+import tempfile
 import time
 from collections import deque
 from concurrent.futures import ThreadPoolExecutor, wait, ALL_COMPLETED
 
 from DMR.utils import ToolsList
+
+
+def _err_text(errfile, limit:int=800) -> str:
+    """从错误日志临时文件里读回最后 limit 个字符。
+
+    子进程的 stderr 重定向到临时文件而不是 PIPE（见 L-12 注释），
+    读文件不会阻塞，也不会因为管道写满把子进程卡死。
+    """
+    try:
+        errfile.seek(0)
+        data = errfile.read()
+        if isinstance(data, bytes):
+            data = data.decode('utf-8', errors='replace')
+        return (data or '')[-limit:]
+    except Exception:
+        return ''
 
 
 class StreamlinkSyncDownloader():
@@ -49,7 +66,11 @@ class StreamlinkSyncDownloader():
             "-i", 'pipe:0',
             "-c:v", "copy",
             "-c:a", "copy",
-            "-reset_timestamps", "1",
+            # 2026-11-16 修（审查报告 L-12）：这里原来还有 "-reset_timestamps","1"。
+            # 该选项只属于 segment muxer，和下面的 "-f flv" 一起用会让 ffmpeg
+            # 启动即报 "Option not found"，同步录制模式一次都起不来（已用
+            # `ffmpeg -h muxer=segment` 核对过归属）。时间戳归一化交给
+            # -avoid_negative_ts 就够了。
             "-avoid_negative_ts", "1",
             "-movflags", "+frag_keyframe+empty_moov",
             "-f", "flv",
@@ -58,8 +79,15 @@ class StreamlinkSyncDownloader():
         self.logger.debug(f'{self.taskname} ffmpeg args: {ffmpeg_args}')
         wait_to_stop = False
 
-        with subprocess.Popen(streamlink_args, stdout=subprocess.PIPE, stderr=subprocess.PIPE) as streamlink_proc:
-            with subprocess.Popen(ffmpeg_args, stdin=streamlink_proc.stdout, stdout=subprocess.PIPE, stderr=subprocess.PIPE) as ffmpeg_proc:
+        # 2026-11-16 修（审查报告 L-12）：两个子进程原来都是 stderr=PIPE
+        # 而**全程不读**，输出写满管道（Windows 约 64KB）后子进程阻塞在写、
+        # 父进程阻塞在读 stdout，双向死锁。现在各自重定向到独立临时文件
+        # （Windows 上父子共享同一 handle 会共享文件指针，所以必须开两份）。
+        sl_err = tempfile.TemporaryFile(prefix='streamlink_err_')
+        ff_err = tempfile.TemporaryFile(prefix='ffmpeg_err_')
+
+        with subprocess.Popen(streamlink_args, stdout=subprocess.PIPE, stderr=sl_err) as streamlink_proc:
+            with subprocess.Popen(ffmpeg_args, stdin=streamlink_proc.stdout, stdout=subprocess.PIPE, stderr=ff_err) as ffmpeg_proc:
                 # 读取第一个数据
                 data = ffmpeg_proc.stdout.read(self.read_block_size)
                 if not data:  # 如果第一个数据为空
@@ -67,12 +95,12 @@ class StreamlinkSyncDownloader():
                     streamlink_proc.kill()  # 终止 streamlink 进程
                     ffmpeg_proc.kill()  # 终止 ffmpeg 进程
                     # 打印错误输出
-                    ffmpeg_err = ffmpeg_proc.stderr.read()
+                    ffmpeg_err = _err_text(ff_err)
                     if ffmpeg_err:
-                        self.logger.error(f"{self.taskname}: ffmpeg启动失败" + ffmpeg_err.decode("utf-8", errors="replace"))
-                    streamlink_err = streamlink_proc.stderr.read()
+                        self.logger.error(f"{self.taskname}: ffmpeg启动失败 " + ffmpeg_err)
+                    streamlink_err = _err_text(sl_err)
                     if streamlink_err:
-                        self.logger.error(f"{self.taskname}: streamlink启动失败" + ffmpeg_err.decode("utf-8", errors="replace"))
+                        self.logger.error(f"{self.taskname}: streamlink启动失败 " + streamlink_err)
                     return False
                 
                 segment_start_time = time.time()
@@ -85,12 +113,12 @@ class StreamlinkSyncDownloader():
                     data = ffmpeg_proc.stdout.read(self.read_block_size)
                     if not data:
                         self.logger.info(f"{self.taskname}: ffmpeg 进程结束")
-                        ffmpeg_err = ffmpeg_proc.stderr.read()
+                        ffmpeg_err = _err_text(ff_err, 300)
                         if ffmpeg_err:
-                            self.logger.debug(f"{self.taskname} ffmpeg: " + ffmpeg_err.decode("utf-8", errors="replace")[-300:])
-                        streamlink_err = streamlink_proc.stderr.read()
+                            self.logger.debug(f"{self.taskname} ffmpeg: " + ffmpeg_err)
+                        streamlink_err = _err_text(sl_err, 300)
                         if streamlink_err:
-                            self.logger.debug(f"{self.taskname} streamlink: " + ffmpeg_err.decode("utf-8", errors="replace")[-300:])
+                            self.logger.debug(f"{self.taskname} streamlink: " + streamlink_err)
                         break
 
                     if not wait_to_stop and time.time() - segment_start_time > self.segment - 10:
@@ -120,12 +148,12 @@ class StreamlinkSyncDownloader():
                 streamlink_proc.kill()
                 video_queue.put(None)
 
-                ffmpeg_err = ffmpeg_proc.stderr.read()
+                ffmpeg_err = _err_text(ff_err)
                 if ffmpeg_err:
-                    self.logger.debug(f"{self.taskname} ffmpeg output: " + ffmpeg_err.decode("utf-8", errors="replace"))
-                streamlink_err = streamlink_proc.stderr.read()
+                    self.logger.debug(f"{self.taskname} ffmpeg output: " + ffmpeg_err)
+                streamlink_err = _err_text(sl_err)
                 if streamlink_err:
-                    self.logger.debug(f"{self.taskname} streamlink output: " + ffmpeg_err.decode("utf-8", errors="replace"))
+                    self.logger.debug(f"{self.taskname} streamlink output: " + streamlink_err)
                 
         return True
 

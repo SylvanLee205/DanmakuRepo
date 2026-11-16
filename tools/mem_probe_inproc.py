@@ -41,6 +41,12 @@ import threading
 import time
 from collections import Counter
 
+try:                                                             # GBK 控制台下 emoji 打印不崩
+    from _guard import ensure_utf8_stdout as _ensure_utf8
+    _ensure_utf8()
+except Exception:                                                # noqa: BLE001
+    pass
+
 __all__ = ['snapshot', 'memory_report', 'top_allocations', 'install', 'try_malloc_trim',
            'status', 'selftest']
 

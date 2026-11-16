@@ -200,10 +200,16 @@ class YuttoDownloader():
             
     @staticmethod
     def _get_video(path:str):
-        if isvideo(path): return path
+        # 2026-11-16 修（审查报告 L-15）：原来只按后缀猜，不做存在性判断。
+        # 实际成品是 .mkv 时会把 path+'.mp4' 当成"视频"，随后 getsize()
+        # 抛 FileNotFoundError，一段下载成功的视频被当成失败跳过。
+        if isvideo(path) and exists(path):
+            return path
         for ext in ['.mp4', '.mkv', '.ts', '.flv']:
-            if isvideo(path+ext):
-                return path+ext
+            cand = path + ext
+            if isvideo(cand) and exists(cand):
+                return cand
+        return None
     
     def download_directly(self):
         self.start_time = self.start_time or datetime.now()
@@ -248,7 +254,10 @@ class YuttoDownloader():
                         elif isdir(filepath):
                             new_dir = join(self.output_dir, fname)
                             shutil.move(filepath, new_dir)
-                            for fn in sorted(os.listdir(filepath)):
+                            # 2026-11-16 修（L-15）：这里原来 listdir(filepath)，
+                            # 文件已经被 move 走了 → FileNotFoundError，
+                            # 整批已搬走的视频一个都没登记（真丢数据）。
+                            for fn in sorted(os.listdir(new_dir)):
                                 fp = join(new_dir, fn)
                                 if not isfile(fp): continue
                                 video_info = VideoInfo(
@@ -266,12 +275,17 @@ class YuttoDownloader():
                                 self.segment_callback(video_info)
                     unused_files = glob.glob(join(temp_dir, '*'))
                     if len(unused_files) > 0:
-                        self.logger.warn(f'下载 {self.url} 时存在无法被处理的文件: {unused_files}, 此文件将被删除.')
+                        self.logger.warning(f'下载 {self.url} 时存在无法被处理的文件: {unused_files}, 此文件将被删除.')
                     self.start_time = stime
             except Exception as e:
                 self.logger.error(f'下载 {self.url} 时出现错误: {e}')
             finally:
-                shutil.rmtree(temp_dir)
+                # 已搬空/已删除的目录再 rmtree 会抛 FileNotFoundError，
+                # 不能让清理失败把整个下载循环带崩（L-15 顺带修）。
+                try:
+                    shutil.rmtree(temp_dir, ignore_errors=True)
+                except Exception:
+                    pass
             
             if self.end_time and datetime.now() > self.end_time:
                 self.stoped = True

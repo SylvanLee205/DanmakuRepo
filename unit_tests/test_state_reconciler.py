@@ -183,7 +183,7 @@ class TestGroupADiskCheck(_RecoveryTestCase):
             on_interrupted_file=InterruptedFileAction.DISCARD
         ).reconcile()
 
-        self.assertEqual(self.repo.get_artifact("a1").state, ArtifactState.SKIPPED)
+        self.assertEqual(self.repo.get_artifact("a1").state, ArtifactState.FAILED)
         self.assertFalse(os.path.exists(part), "discard 策略应删除 .part")
         self.assertEqual([a.reason for a in report.interrupted], ["discarded"])
 
@@ -386,7 +386,7 @@ class TestInterruptedFileShapes(_RecoveryTestCase):
             on_interrupted_file=InterruptedFileAction.DISCARD
         ).reconcile()
 
-        self.assertEqual(self.repo.get_artifact("a1").state, ArtifactState.SKIPPED)
+        self.assertEqual(self.repo.get_artifact("a1").state, ArtifactState.FAILED)
         self.assertFalse(os.path.exists(part))
         self.assertFalse(os.path.exists(final))
         self.assertEqual([a.reason for a in report.interrupted], ["discarded"])
@@ -436,7 +436,7 @@ class TestGroupDReclaim(_RecoveryTestCase):
 
         report = self.manager(stale_after=7 * 24 * 3600).reconcile()
 
-        self.assertEqual(self.repo.get_artifact("a1").state, ArtifactState.SKIPPED)
+        self.assertEqual(self.repo.get_artifact("a1").state, ArtifactState.FAILED)
         self.assertEqual(len(report.stale), 1)
 
     def test_d3_fresh_non_terminal_is_kept(self):

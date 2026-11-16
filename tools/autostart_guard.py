@@ -70,7 +70,11 @@ def running_pids() -> list:
             try:
                 if (p.info['name'] or '').lower() != 'python.exe':
                     continue
-                if any('main.py' in (a or '') for a in (p.info['cmdline'] or [])):
+                if any(os.path.basename(str(a)).lower() == 'main.py'
+                       for a in (p.info['cmdline'] or [])[1:]):
+                    # 2026-11-16：原判据 `'main.py' in arg` 会把 domain.py
+                    # 也算进来 —— 机器上有别的项目在跑时，本脚本会认定
+                    # "DMR 已在运行"，于是永不启动 DMR。改成按 basename 精确匹配。
                     out.append(p.info['pid'])
             except Exception:
                 continue

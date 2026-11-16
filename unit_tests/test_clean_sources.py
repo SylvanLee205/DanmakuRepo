@@ -33,6 +33,7 @@ import json
 import os
 import re
 import shutil
+import sqlite3
 import tempfile
 import time
 import unittest
@@ -40,6 +41,32 @@ import unittest
 MODULE_PATH = os.path.join(
     os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
     'tools', 'clean_sources.py')
+
+
+def make_state_db(root, rows):
+    """在 ``<root>/logs/dmr_state.db`` 造一个最小状态库。
+
+    ``rows``: ``[(session_id, idx, kind, state, data_dict), ...]``。
+    2026-11-16 起 clean_sources 的「本地已渲染」判据必须再由状态库确认
+    成品已上传/按规则跳过，测试因此需要一个真实（最小）的库。
+    """
+    os.makedirs(os.path.join(root, 'logs'), exist_ok=True)
+    db = os.path.join(root, 'logs', 'dmr_state.db')
+    con = sqlite3.connect(db)
+    try:
+        con.execute(
+            'CREATE TABLE IF NOT EXISTS artifacts ('
+            ' artifact_id TEXT PRIMARY KEY, session_id TEXT,'
+            ' segment_idx INTEGER, kind TEXT, state TEXT,'
+            ' updated_at INTEGER, data TEXT)')
+        for sid, idx, kind, state, data in rows:
+            con.execute(
+                'INSERT OR REPLACE INTO artifacts VALUES (?,?,?,?,?,?,?)',
+                (f'{sid}:{kind}:{idx}', sid, idx, kind, state, 0,
+                 json.dumps(data, ensure_ascii=False)))
+        con.commit()
+    finally:
+        con.close()
 
 
 def load_module():
@@ -183,8 +210,13 @@ class TestPendingCleanGuard(unittest.TestCase):
                   'w', encoding='utf-8') as f:
             json.dump(entries, f, ensure_ascii=False)
 
-    def _make_ripe_file(self, task, name, *, render=True):
-        """造一个"老文件 + 有成品"的理想删除候选。"""
+    def _make_ripe_file(self, task, name, *, render=True, state='uploaded',
+                        reason=''):
+        """造一个"老文件 + 有成品"的理想删除候选。
+
+        2026-11-16 起还必须登记状态库：判据从"本地有 mp4"收紧成
+        "状态库确认成品已上传（或按规则跳过上传）"。
+        """
         src = os.path.join(self.m.REPLAY, '原视频', task)
         out = os.path.join(self.m.REPLAY, '弹幕版', task)
         os.makedirs(src, exist_ok=True)
@@ -194,11 +226,40 @@ class TestPendingCleanGuard(unittest.TestCase):
             f.write('x')
         old = 100000
         os.utime(p, (old, old))
+        rendered = os.path.splitext(name)[0] + '（弹幕版）.mp4'
         if render:
-            rp = os.path.join(out, os.path.splitext(name)[0] + '（弹幕版）.mp4')
+            rp = os.path.join(out, rendered)
             with open(rp, 'w') as f:
                 f.write('y')
+            if state is not None:
+                make_state_db(self.tmp, [
+                    ('s1', 1, 'src_video', 'recorded',
+                     {'path': f'./直播回放/原视频/{task}/{name}'}),
+                    ('s1', 1, 'dm_video', state,
+                     {'path': f'./直播回放/弹幕版/{task}/{rendered}',
+                      'last_error': reason}),
+                ])
         return p
+
+    def test_rendered_but_not_uploaded_is_protected(self):
+        """★2026-11-16：渲染成功≠已上传，源视频是唯一原始画质副本，不能删。"""
+        name = '丁-2026年11月12日10点00分.ts'
+        p = self._make_ripe_file('丁', name, state='rendered')
+        self._write_queue([])
+        ok, skipped = self.m.find_candidates(min_age_minutes=30)
+        self.assertNotIn(p, [x[0] for x in ok],
+                         '未上传的分段被列入可清理 —— 删除后原始画质永久丢失')
+        self.assertIn(p, [x[0] for x in skipped])
+
+    def test_missing_state_record_is_protected(self):
+        """状态库查不到该分段 → 保守保留（人工确认后再删）。"""
+        name = '戊-2026年11月12日11点00分.ts'
+        p = self._make_ripe_file('戊', name, state=None)   # 建库但不写这条
+        make_state_db(self.tmp, [])
+        self._write_queue([])
+        ok, skipped = self.m.find_candidates(min_age_minutes=30)
+        self.assertNotIn(p, [x[0] for x in ok])
+        self.assertIn(p, [x[0] for x in skipped])
 
     def test_pending_file_is_protected(self):
         """★核心回归：在队列里的文件必须跳过（哪怕它"已渲染"）。"""
@@ -273,7 +334,8 @@ class TestSkipUploadSemantics(unittest.TestCase):
         self.m.ROOT, self.m.REPLAY = self._orig_root, self._orig_replay
         self.m.cloud_files = self._orig_cloud
 
-    def _make_old_source_with_render(self, name):
+    def _make_old_source_with_render(self, name, state='skipped',
+                                     reason='命中跳过上传规则：横屏 + 码率 3000kbps'):
         src = os.path.join(self.m.REPLAY, '原视频', '甲')
         out = os.path.join(self.m.REPLAY, '弹幕版', '甲')
         os.makedirs(src, exist_ok=True)
@@ -283,10 +345,16 @@ class TestSkipUploadSemantics(unittest.TestCase):
             f.write('x')
         old = 100000                      # 远早于 24h
         os.utime(p, (old, old))
-        with open(os.path.join(out,
-                               os.path.splitext(name)[0] + '（弹幕版）.mp4'),
-                  'w') as f:
+        rendered = os.path.splitext(name)[0] + '（弹幕版）.mp4'
+        with open(os.path.join(out, rendered), 'w') as f:
             f.write('y')                  # 弹幕版只在本地，云端没有
+        make_state_db(self.tmp, [
+            ('s1', 1, 'src_video', 'recorded',
+             {'path': f'./直播回放/原视频/甲/{name}'}),
+            ('s1', 1, 'dm_video', state,
+             {'path': f'./直播回放/弹幕版/甲/{rendered}',
+              'last_error': reason}),
+        ])
         return p
 
     def test_cleanable_when_cloud_query_unavailable(self):

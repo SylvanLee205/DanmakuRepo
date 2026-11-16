@@ -94,18 +94,18 @@ class TestRoomIdParsing(unittest.TestCase):
         cls.m = load_module()
 
     def test_plain_room_id(self):
-        self.assertEqual(self.m.parse_room_ids('865102911165'), ['865102911165'])
+        self.assertEqual(self.m.parse_room_ids('123456789012'), ['123456789012'])
 
     def test_full_url(self):
-        ids = self.m.parse_room_ids('https://live.douyin.com/865102911165')
-        self.assertEqual(ids, ['865102911165'])
+        ids = self.m.parse_room_ids('https://live.douyin.com/123456789012')
+        self.assertEqual(ids, ['123456789012'])
 
     def test_share_text_with_noise(self):
         """抖音分享出来是一坨带表情和说明的文字，要能把链接抠出来。"""
         text = ('7- #在抖音，记录美好生活#【某某】正在直播，来和我一起支持Ta吧。'
                 '复制下方链接，打开【抖音】，直接观看直播！ '
-                'https://live.douyin.com/865102911165')
-        self.assertEqual(self.m.parse_room_ids(text), ['865102911165'])
+                'https://live.douyin.com/123456789012')
+        self.assertEqual(self.m.parse_room_ids(text), ['123456789012'])
 
     def test_multiple_links(self):
         text = ('https://live.douyin.com/111111111 '

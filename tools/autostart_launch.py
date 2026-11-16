@@ -67,7 +67,15 @@ LOGGED_IN_DEAD_GRACE = 1800  # 有人登录但 DMR 死了，等这么久才 sess
                              # （登录自启自己有 3 次重试；给够了时间，
                              #   用户手动双击启动也不会被"已在运行"挡住）
 POLL = 60                   # 守护模式轮询间隔（秒）
-LOCK_MAX_AGE = 150          # 互斥锁超过这么久算陈旧（上一个运行者崩了）
+#: 互斥锁"陈旧"阈值。必须**大于**最坏持锁时长（migrate 分支 stop_all 最多
+#: 3×300s + 启动重试 3×25s ≈ 975s）。2026-11-16 之前是 150s，持锁超过 150s
+#: 后另一次运行会把锁判成陈旧删掉并并发进入 → 双 stop / 双 start。
+#: 同时持有者每 LOCK_HEARTBEAT 秒刷新 mtime，正常情况下永远不算陈旧。
+LOCK_MAX_AGE = 1800
+LOCK_HEARTBEAT = 30
+
+_heartbeat_thread = None
+_heartbeat_stop = None
 
 DRY_RUN = '--dry-run' in sys.argv
 
@@ -100,9 +108,17 @@ PRETEND_SESSION = _int_flag('--pretend-session', None, None)
 EXPLORER_Q = ("(Get-CimInstance Win32_Process -Filter \"Name='explorer.exe'\" | "
               "Measure-Object).Count")
 
-#: DMR 主进程（venv 启动器和 C:\Python311 真身都会匹配 main.py），带出会话号
+#: DMR 主进程（venv 启动器和 C:\Python311 真身都会匹配 main.py），带出会话号。
+#:
+#: 2026-11-16：原写法 `$_.CommandLine -like '*main.py*'` 有两个问题：
+#:   1. 子串匹配 —— `domain.py` / `mymain.py` 也会命中，机器上有别的项目在跑
+#:      时，本脚本会认定"DMR 已在运行"，于是永不启动 DMR；
+#:   2. 不判属主 —— 别的项目的 main.py 同样算数。
+#: 改成"main.py 作为独立参数出现" + "命令行含本项目名"。
+_PROJ_NAME = os.path.basename(UP)
 DMR_Q = ("Get-CimInstance Win32_Process -Filter \"Name='python.exe'\" | "
-         "Where-Object { $_.CommandLine -like '*main.py*' } | "
+         "Where-Object { $_.CommandLine -match '(?i)(^|[\\s\"])main\\.py([\\s\"]|$)'"
+         f" -and $_.CommandLine -like '*{_PROJ_NAME}*' }} | "
          "ForEach-Object { \"$($_.ProcessId),$($_.SessionId)\" }")
 
 
@@ -231,6 +247,43 @@ def logon_action(procs, mine: int) -> str:
 _LOCK_HELD = False
 
 
+def _start_heartbeat() -> None:
+    """持锁期间定时刷新锁文件 mtime。
+
+    没有心跳时，"持锁多久"就等于"锁文件多久没被写"，而 migrate 分支在
+    某些机器上真的会持锁十几分钟 —— 另一次运行据此判"陈旧"删锁并发进入，
+    两个 stop/start 撞在一起。心跳把"持锁时长"和"文件年龄"解耦。
+    """
+    global _heartbeat_thread, _heartbeat_stop
+    try:
+        import threading
+        _heartbeat_stop = threading.Event()
+
+        def _beat():
+            while not _heartbeat_stop.wait(LOCK_HEARTBEAT):
+                try:
+                    os.utime(LOCK, None)
+                except OSError:
+                    return
+
+        _heartbeat_thread = threading.Thread(target=_beat, daemon=True,
+                                             name='autostart-lock-heartbeat')
+        _heartbeat_thread.start()
+    except Exception:                                            # noqa: BLE001
+        pass
+
+
+def _stop_heartbeat() -> None:
+    global _heartbeat_thread, _heartbeat_stop
+    try:
+        if _heartbeat_stop is not None:
+            _heartbeat_stop.set()
+    except Exception:                                            # noqa: BLE001
+        pass
+    _heartbeat_thread = None
+    _heartbeat_stop = None
+
+
 def acquire_lock(max_age: float = LOCK_MAX_AGE) -> bool:
     """拿到返回 True；别人正在跑（锁很新）返回 False。
 
@@ -246,6 +299,7 @@ def acquire_lock(max_age: float = LOCK_MAX_AGE) -> bool:
             finally:
                 os.close(fd)
             _LOCK_HELD = True
+            _start_heartbeat()
             return True
         except FileExistsError:
             try:
@@ -268,6 +322,7 @@ def release_lock() -> None:
     global _LOCK_HELD
     if not _LOCK_HELD:
         return
+    _stop_heartbeat()
     try:
         os.remove(LOCK)
     except OSError:

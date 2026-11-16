@@ -139,7 +139,14 @@ def main():
         return 0
 
     bak = f'{opt.db}.bak-{time.strftime("%Y%m%d-%H%M%S")}'
-    shutil.copy2(opt.db, bak)
+    _bak_ok = False
+    try:
+        from _guard import sqlite_backup
+        _bak_ok = sqlite_backup(opt.db, bak)
+    except Exception:                                            # noqa: BLE001
+        pass
+    if not _bak_ok:
+        shutil.copy2(opt.db, bak)
     print(f'\n  已备份状态库 → {bak}')
 
     for aid, kind, state, fixed in targets:

@@ -30,6 +30,12 @@ if _PROJECT_ROOT not in sys.path:
 
 from DMR.paths import ROOT as PROJ  # noqa: E402
 
+try:                                                             # GBK 控制台下 emoji 打印不崩
+    from _guard import ensure_utf8_stdout as _ensure_utf8
+    _ensure_utf8()
+except Exception:                                                # noqa: BLE001
+    pass
+
 #: 备份到目标盘时的子目录名（跟着项目目录名走）
 NAME = os.path.basename(PROJ.rstrip('\\/')) or 'DanmakuRepo'
 
@@ -73,11 +79,14 @@ def robocopy(src, dst, extra_exclude=()):
 
 def pick_drive():
     """挑一个存在、且不是项目所在盘的盘符，优先 D:。"""
-    proj_drive = os.path.splitdrive(PROJ)[0].upper()
+    proj_drive = os.path.splitdrive(PROJ)[0].upper()      # 形如 'F:'
     candidates = []
     for letter in string.ascii_uppercase:
         d = f'{letter}:\\'
-        if d.upper() == proj_drive or not os.path.isdir(d):
+        # ⚠️ 2026-11-16：原来是 d.upper() == proj_drive，左边是 'F:\\'、
+        #    右边是 'F:'，永假 —— 于是没有 D: 盘时会挑回项目所在的 F:，
+        #    "异盘备份"备到同一块盘上，盘一坏两份全没。按盘符比较。
+        if d[:2].upper() == proj_drive or not os.path.isdir(d):
             continue
         try:
             free = shutil.disk_usage(d).free
@@ -128,9 +137,17 @@ def do_backup(to_drive, dry=False, with_videos=False):
     got = count_files(os.path.join(dst, NAME))
     print(f'{"✅" if ok else "❌"} rc={rc}  {got} 个文件')
 
-    verify(dst, expect_videos=with_videos)
+    # 2026-11-16：原来无论复制成败、校验是否通过都 return 0，
+    # Backup_To_Disk.bat 因此永远显示成功 —— 备份坏了也没人知道。
+    bad = verify(dst, expect_videos=with_videos)
     print(f'\n  完成: {dst}')
     print(f'  总大小: {human(dir_size(dst))} / {count_files(dst)} 个文件')
+    if not ok:
+        print('  ❌ robocopy 返回失败（rc=%s），备份不完整。' % rc)
+        return 1
+    if bad:
+        print(f'  ❌ 校验有 {bad} 项不通过，备份不可信。')
+        return 1
     return 0
 
 

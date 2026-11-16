@@ -12,14 +12,82 @@
 """
 import argparse
 import os
+import re
 import shutil
 import subprocess
 import sys
 import time
 
+try:                                                             # GBK 控制台下 emoji 打印不崩
+    from _guard import ensure_utf8_stdout as _ensure_utf8
+    _ensure_utf8()
+except Exception:                                                # noqa: BLE001
+    pass
+
 PROJ = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if PROJ not in sys.path:
     sys.path.insert(0, PROJ)
+
+#: 配置里这些键的值一律不进诊断包（cookie 是账号凭证，泄露等于交出账号）
+SENSITIVE_CONFIG_KEYS = {
+    'cookie', 'cookies', 'bili_watch_cookies', 'password', 'passwd',
+    'token', 'secret', 'api_key', 'notify_key', 'serverchan_key',
+    'sessdata', 'bili_jct', 'dedeuserid', 'ac_time_value', 'access_key',
+    'secret_key', 'sctp', 'key',
+}
+
+
+def _mask_config(obj):
+    """递归把配置里的凭证替换成占位符（dict 版，少量场景用）。"""
+    if isinstance(obj, dict):
+        out = {}
+        for k, v in obj.items():
+            if str(k).lower() in SENSITIVE_CONFIG_KEYS and v not in (None, '', [], {}):
+                out[k] = '<已脱敏>'
+            else:
+                out[k] = _mask_config(v)
+        return out
+    if isinstance(obj, list):
+        return [_mask_config(x) for x in obj]
+    if isinstance(obj, str):
+        # 字符串里夹带的 Server酱 key 也要抹掉
+        return re.sub(r'sctp[A-Za-z0-9]{12,}', '<Server酱key已脱敏>', obj)
+    return obj
+
+
+def _mask_config_text(text: str) -> str:
+    """按行掩码 yaml 文本。
+
+    为什么不 ``yaml.safe_dump(masked)``：dump 会丢掉**全部注释**，而
+    global.yml 的价值一半在注释里（"为什么这个值是这样"）。诊断包应保留
+    注释与结构，只把凭证值换掉。
+
+    支持块标量（``cookies: |`` 后面跟多行）——cookie 通常就是这么写的。
+    """
+    out = []
+    block_indent = None
+    for line in text.splitlines(True):
+        stripped = line.strip()
+        indent = len(line) - len(line.lstrip())
+        if block_indent is not None:
+            if stripped and indent > block_indent:
+                out.append(' ' * indent + '<已脱敏>' + ('\n' if line.endswith('\n') else ''))
+                continue
+            block_indent = None
+        m = re.match(r'^(\s*)([A-Za-z_][\w\-]*)\s*:\s*(.*)$', line)
+        if m:
+            key, val = m.group(2), m.group(3)
+            if key.lower() in SENSITIVE_CONFIG_KEYS:
+                if val.strip() in ('|', '>', '|-', '>-', '|+', '>+'):
+                    out.append(line)
+                    block_indent = indent
+                    continue
+                if val.strip() and not val.strip().startswith('#'):
+                    nl = '\n' if line.endswith('\n') else ''
+                    out.append(f'{m.group(1)}{key}: <已脱敏>{nl}')
+                    continue
+        out.append(re.sub(r'sctp[A-Za-z0-9]{12,}', '<Server酱key已脱敏>', line))
+    return ''.join(out)
 
 IS_WIN = sys.platform == 'win32'
 
@@ -244,6 +312,10 @@ def chk_tasks():
                 denied = True
                 continue
             add(WARN, f'计划任务 {n}', f'查询失败: {e}', '')
+            # ⚠️ 2026-11-16：这里必须 continue。否则 r 未绑定，下一行
+            #    r.returncode 直接 UnboundLocalError，整个 chk_tasks 中止
+            #    （首次迭代）或误用上一个任务的 r（后续迭代）。
+            continue
         if r.returncode != 0:
             err = ((r.stderr or '') + (r.stdout or '')).lower()
             if 'denied' in err or '拒绝访问' in err or '权限' in err:
@@ -436,10 +508,17 @@ def export_pack():
                     n += 1
                 except OSError:
                     pass
-        # 配置（只放 global.yml 和任务清单，不含 cookie）
+        # 配置：global.yml **脱敏后**放入（原实现注释写"不含 cookie"，实际整份写进
+        # 去了 —— 而 --export 的用途正是"发给别人/AI 看"）。
         g = os.path.join(PROJ, 'configs', 'global.yml')
         if os.path.exists(g):
-            zf.write(g, 'configs/global.yml')
+            try:
+                with open(g, encoding='utf-8') as f:
+                    raw = f.read()
+                zf.writestr('configs/global.yml', _mask_config_text(raw))
+            except Exception as e:                               # noqa: BLE001
+                zf.writestr('configs/global.yml.masked-failed.txt',
+                            f'配置脱敏失败，为避免泄露未包含原文: {e}')
         cfg = os.path.join(PROJ, 'configs')
         if os.path.isdir(cfg):
             tasks = sorted(f for f in os.listdir(cfg)

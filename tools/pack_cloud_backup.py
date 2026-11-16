@@ -29,6 +29,12 @@ if _PROJECT_ROOT not in sys.path:
 
 from DMR.paths import ROOT as PROJ  # noqa: E402
 
+try:                                                             # GBK 控制台下 emoji 打印不崩
+    from _guard import ensure_utf8_stdout as _ensure_utf8
+    _ensure_utf8()
+except Exception:                                                # noqa: BLE001
+    pass
+
 #: 整个目录跳过
 SKIP_DIRS = {'.venv', '__pycache__', '.temp', '.git', '.trash',
              '直播回放', 'node_modules', 'backups'}

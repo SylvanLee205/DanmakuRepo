@@ -404,13 +404,29 @@ class Uploader():
     def stop(self):
         self.stoped = True
         self.upload_executors.shutdown(wait=False)
-        for upload_group in self._uploader_pool:
-            self._uploader_pool[upload_group]['class'].stop()
+        # 2026-11-16 修（审查报告 L-8）：
+        #   ① 原来无锁遍历 self._uploader_pool，而 _free_uploader_pool 是在锁里
+        #      pop 的 → 并发时 RuntimeError: dictionary changed size during
+        #      iteration（Render 那边早就修过同类问题，Uploader 漏了）。
+        #   ② 原来把**所有** upload_tasks 都抄进 failed_tasks，包括正在上传的。
+        #      shutdown(wait=False) 并不保证它们已停下，工作线程可能随后成功；
+        #      清单里却留下这条"失败记录"，人工一重试就变成重复投稿。
+        #      现在只收"还没开始"的任务；在跑的交给状态库（UPLOADING → 重启
+        #      对账降级为 RECORDED → 自动恢复），不做主观判断。
+        with self._lock:
+            pool = list(self._uploader_pool.values())
+        for entry in pool:
+            try:
+                entry['class'].stop()
+            except Exception as e:
+                self.logger.exception(e)
         
         with self._lock:
-            for uuid, task in self.upload_tasks.items():
-                if uuid not in self.failed_tasks:
-                    self.failed_tasks[uuid] = task
+            for task_uuid, task in list(self.upload_tasks.items()):
+                if task.get('status') != 'waiting':
+                    continue
+                if task_uuid not in self.failed_tasks:
+                    self.failed_tasks[task_uuid] = task
             self.save_failed_tasks()
 
         self.logger.info('Uploader stopped.')

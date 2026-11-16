@@ -101,16 +101,24 @@ class DMREngine():
         self._piperecvprocess.start()
         self.logger.debug('DMR engine started.')
 
-        for name, plugin in self.plugin_dict.values():
-            if plugin['status'] == 0:
-                plugin['class'].start()
-                self.plugin_dict['name']['status'] = 1
+        # 2026-11-16 修（审查报告 L-5）：原来写成
+        #     for name, plugin in self.plugin_dict.values():
+        #         ...
+        #         self.plugin_dict['name']['status'] = 1
+        # values() 里的元素是 4 键 dict，解包给 2 个变量必 ValueError；
+        # 而 'name' 是字面量字符串，必然 KeyError。只因为生产流程是
+        # "先 start() 再 add_plugin()"（此刻字典为空）才一直没炸，
+        # 任何"先 add 后 start"的调用顺序都会立刻崩。
+        for name, entry in self.plugin_dict.items():
+            if entry['status'] == 0:
+                entry['class'].start()
+                entry['status'] = 1
                 self.logger.debug(f'Plugin {name} started.')
-        
-        for name, task in self.task_dict.values():
-            if task['status'] == 0:
-                task['class'].start()
-                self.task_dict['name']['status'] = 1
+
+        for name, entry in self.task_dict.items():
+            if entry['status'] == 0:
+                entry['class'].start()
+                entry['status'] = 1
                 self.pipeSend(PipeMessage('engine', f'replay/{name}', 'ready'))
                 self.logger.debug(f'Task {name} started.')
 

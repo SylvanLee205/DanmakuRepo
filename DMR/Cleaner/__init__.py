@@ -299,13 +299,19 @@ class Cleaner():
                     self.logger.warning(f'文件 {file.path} 不存在，跳过清理.')
                     continue
 
-                # ── 硬性保护：弹幕版永不删除（2026-10-19 用户要求，"重中之重"）──
+                # ── 硬性保护：弹幕版永不被清理（2026-10-19 用户要求，"重中之重"）──
                 # 不依赖 clean_args：配置被改、默认值变化、旧任务被恢复，
                 # 都不能让弹幕版消失。这一条一旦出错是不可恢复的数据丢失，
                 # 所以宁可在这里拦一道，出错就往死里喊。
-                if method == 'delete' and is_dm_video_path(file.path):
+                #
+                # ⚠️ 2026-11-16：原来只判 method == 'delete'，于是
+                #    · move 到 '*TRASHBIN*'（回收站＝删除）
+                #    · custom 里写任意删除命令
+                #    · copy 把成品复制出录制目录造成重复
+                #    都能绕过这道闸。清理动作对成品一律拒绝，与 method 无关。
+                if is_dm_video_path(file.path):
                     self.logger.error(
-                        f'拒绝删除弹幕版（按规则永不清理）: {file.path}'
+                        f'拒绝清理弹幕版（按规则永不清理，method={method}）: {file.path}'
                         f' —— 触发方: {task.get("source")}；请检查 clean_args 配置。')
                     continue
 

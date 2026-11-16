@@ -18,9 +18,15 @@ class ReplayTask():
         self.stoped = True
 
     def add_event(self, event, trigger):
-        if self._event_dict.get(event) != None:
-            self._event_dict[event].append(trigger)
-        self._event_dict[event] = [trigger]
+        # 2026-11-16 修（审查报告 L-6）：原来是
+        #     if self._event_dict.get(event) != None:
+        #         self._event_dict[event].append(trigger)
+        #     self._event_dict[event] = [trigger]
+        # 第二行**无条件覆盖**，append 的结果永远被丢掉，同一事件只能挂一个
+        # 回调；更糟的是 start() 对 list 型 trigger 先逐个 add，最后又把 list
+        # 本身 add 进来，于是监控循环里 func(msg) 会拿 list 当函数调 → TypeError。
+        # 现在值全是单个方法才没暴露。
+        self._event_dict.setdefault(event, []).append(trigger)
 
     def _pipeSend(self, msg:PipeMessage):
         if not msg.source.startswith('replay/'):
@@ -78,6 +84,8 @@ class ReplayTask():
 
     def start(self):
         self.stoped = False
+        # 重复 start 会把回调挂两遍（同一事件触发两次渲染/上传），先清空。
+        self._event_dict.clear()
         self._piperecvprocess = threading.Thread(target=self._pipeRecvMonitor, daemon=True)
         self._piperecvprocess.start()
 
@@ -85,7 +93,10 @@ class ReplayTask():
             if isinstance(trigger, (list, tuple, set)):
                 for func in trigger:
                     self.add_event(event, func)
-            self.add_event(event, trigger)
+            else:
+                # 2026-11-16 修（L-6）：原来这里无 else，list 型会把整个
+                # list 也 add 进来（见 add_event 注释）。
+                self.add_event(event, trigger)
 
     def stop(self):
         self.stoped = True

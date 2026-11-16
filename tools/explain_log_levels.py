@@ -5,6 +5,12 @@ import re
 import subprocess
 import time
 
+try:                                                             # GBK 控制台下 emoji 打印不崩
+    from _guard import ensure_utf8_stdout as _ensure_utf8
+    _ensure_utf8()
+except Exception:                                                # noqa: BLE001
+    pass
+
 _PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))   # 项目根目录，自动识别（可放在任意路径）
 
 
@@ -73,7 +79,7 @@ print()
 print('=' * 78)
 print('4. 实际日志文件里搜"直播开始"和"直播已结束"')
 print('=' * 78)
-logs = sorted(glob.glob(os.path.join(UP, 'logs', 'DMR-2026*.log')),
+logs = sorted(glob.glob(os.path.join(UP, 'logs', 'DMR-*.log')),
               key=os.path.getmtime, reverse=True)
 if logs:
     lg = logs[0]

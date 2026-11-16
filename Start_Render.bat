@@ -32,7 +32,12 @@ call "%~dp0_env.bat"
 if errorlevel 1 (
   echo [X] No Python 3 found on this machine.
   echo     Run Setup.bat once ^(double-click it^) - it installs everything.
-  pause
+  rem NEVER pause here: this script also runs from the boot scheduled task in
+  rem session 0, where there is no console. A pause would hang forever:
+  rem no recording, no retry, and nothing in autostart.log.
+  rem Write the reason to a file instead and exit so the task can be seen as failed.
+  if not exist "%~dp0logs" mkdir "%~dp0logs"
+  >>"%~dp0logs\startup_error.log" echo [%date% %time%] %~nx0: no Python 3 found, run Setup.bat
   exit /b 1
 )
 

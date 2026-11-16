@@ -357,10 +357,20 @@ class DanmakuRepo():
                         '  ' + '=' * 58)
             
             elif update_type == 'tasks':
+                # 2026-11-16 修（审查报告 L-1）：这里原来直接
+                #   self.config.get_replay_config(taskname)
+                # 少了 _with_state_repo，热加载进来的任务拿到的
+                # replay_config 里没有 state_repo → LiveEvents 所有
+                # _sync_artifact / _sync_upload_group 静默 return，
+                # 状态库里看不到这个任务的任何进度，重启后进度全丢。
+                # 启动路径（engine.add_task 之前）是包了 _with_state_repo 的，
+                # 只有这两条热加载分支漏了。
                 for config_path in update_info['new']:
                     taskname = filename_to_taskname(config_path)
                     self.logger.info(f'检测到新任务配置文件: {taskname}，正在添加任务...')
-                    self.engine.add_task(taskname, self.config.get_replay_config(taskname))
+                    self.engine.add_task(
+                        taskname,
+                        self._with_state_repo(self.config.get_replay_config(taskname)))
                 
                 for config_path in update_info['deleted']:
                     taskname = filename_to_taskname(config_path)
@@ -374,7 +384,9 @@ class DanmakuRepo():
                     self.engine.del_task(taskname)
                     time.sleep(5)
                     new_taskname = filename_to_taskname(config_path)
-                    self.engine.add_task(new_taskname, self.config.get_replay_config(new_taskname))
+                    self.engine.add_task(
+                        new_taskname,
+                        self._with_state_repo(self.config.get_replay_config(new_taskname)))
 
         except Exception as e:
             self.logger.error(f'动态载入配置文件错误:')

@@ -127,7 +127,9 @@ class TestSuperviseDecisions(unittest.TestCase):
         m = load_module(['--boot-fallback', '180', '--dry-run'])
         lines = []
         m.log = lines.append          # 别往生产 autostart.log 里写测试痕迹
-        m.ps = lambda cmd: (dmr_out if 'main.py' in cmd else explorer_out)
+        # 2026-11-16（审查报告 R-8）：进程查询语句改成了正则
+        # `main\.py`，所以匹配键不能再写死 'main.py'（含未转义的点）。
+        m.ps = lambda cmd: (dmr_out if 'main' in cmd else explorer_out)
         try:
             rc = m.mode_supervise()
         finally:

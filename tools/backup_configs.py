@@ -47,6 +47,12 @@ CONFIGS = os.path.join(ROOT, 'configs')
 if ROOT not in sys.path:
     sys.path.insert(0, ROOT)
 from DMR.paths import snapshot_dir as _snapshot_dir
+
+try:                                                             # GBK 控制台下 emoji 打印不崩
+    from _guard import ensure_utf8_stdout as _ensure_utf8
+    _ensure_utf8()
+except Exception:                                                # noqa: BLE001
+    pass
 SNAP_ROOT = _snapshot_dir()
 MANIFEST = 'manifest.json'
 

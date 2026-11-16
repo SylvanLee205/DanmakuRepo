@@ -172,11 +172,10 @@ class TestEventRegistry(DMRTestCase):
         self.assertIn("ready", events.event_dict)
         self.assertNotIn("engine/ready", events.event_dict)
 
-    @unittest.expectedFailure
     def test_add_event_accumulates_handlers(self):
-        """同一事件注册两个 handler 时都应被保留（B7.3）。
+        """同一事件注册两个 handler 时都应被保留（B7.3，2026-11-16 已修 L-6）。
 
-        ``replaytask.py:21-23`` 先 ``append`` 又无条件覆盖，导致只留最后一个。
+        ``replaytask.add_event`` 原来先 ``append`` 又无条件覆盖，只留最后一个。
         """
         task = self._registry()
 
@@ -191,16 +190,26 @@ class TestEventRegistry(DMRTestCase):
 
         self.assertEqual(len(task._event_dict["render/end"]), 2)
 
-    @unittest.expectedFailure
-    def test_add_event_with_list_value_does_not_nest(self):
-        """``event_dict`` 值为 list 时不应产生嵌套结构（B7.3 的另一面）。
+    def test_start_flattens_list_trigger(self):
+        """``event_dict`` 值为 list 时，``start()`` 应逐个注册（B7.3 的另一面）。
 
-        ``replaytask.py:78-82`` 会先对 list 的每个元素 ``add_event``，再把整个
-        list 也 ``add_event`` 一次，于是末元素变成 list-of-list，回放时
-        ``func(msg)`` 直接 TypeError。当前不触发仅因为 ``liveevents.event_dict``
-        的值都是单个 bound method。
+        2026-11-16 修（审查报告 L-6）：``replaytask.start()`` 原来对 list 型
+        trigger 先逐个 ``add_event``，最后又把整个 list 也 ``add_event`` 一次，
+        于是末元素变成 list，回放时 ``func(msg)`` 直接 TypeError。
+        现在 list 只展开、不再把容器本身注册进去。
         """
-        task = self._registry()
+        import queue as _queue
+        from types import SimpleNamespace
+
+        from DMR.Task import ReplayTask
+
+        task = ReplayTask.__new__(ReplayTask)
+        task._event_dict = {}
+        task.stoped = True
+        task.logger = __import__('logging').getLogger('test')
+        task.recv_queue = _queue.Queue()
+        task.send_queue = _queue.Queue()
+        task.taskname = 'tt'
 
         def first(_msg):
             return None
@@ -208,12 +217,12 @@ class TestEventRegistry(DMRTestCase):
         def second(_msg):
             return None
 
-        # 复刻 replaytask.start() 对 list 值的处理方式
-        for func in (first, second):
-            task.add_event("e", func)
-        task.add_event("e", [first, second])
+        task.event_class = SimpleNamespace(event_dict={'e': [first, second]})
+        task.start()
 
-        for entry in task._event_dict["e"]:
+        entries = task._event_dict['e']
+        self.assertEqual(len(entries), 2)
+        for entry in entries:
             self.assertTrue(callable(entry),
                             f"handler 应为可调用对象，实际为 {type(entry).__name__}")
 

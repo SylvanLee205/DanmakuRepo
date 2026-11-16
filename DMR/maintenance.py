@@ -282,6 +282,7 @@ class Maintenance:
                        '  1) 把「弹幕版」移到别的盘或网盘',
                        '  2) 或设 DMR_DATA_ROOT 指向更大的盘'])
 
+    @staticmethod
     def _has_danmaku(src_dir: str, dm_base: str) -> bool:
         """源视频有没有对应的弹幕版产物（新/老两种布局都认）。
 
@@ -303,6 +304,118 @@ class Maintenance:
         # 躺在源目录里（更早的版本确实是这样）
         return _in(src_dir)
 
+    @staticmethod
+    def _removable_sources(logger) -> dict | None:
+        """状态库里"可以安全删源"的路径集合：``{归一化源路径: 说明}``。
+
+        ⚠️ 2026-11-16 加（审查报告 D-9）。原判据只有「有弹幕版产物 + 2 小时
+        没动」，不查上传状态 —— 磁盘告急时会把**刚渲完、还没上传**的源直接
+        删掉（源是唯一原始画质副本，删了再也渲染不出来）。判据必须是：
+
+          · 同分段的 ``dm_video`` 状态为 ``uploaded``（云端已确认），或
+          · 为 ``skipped`` 且原因是"按规则主动不上传"（skip_upload_rule /
+            长度门槛），此时源本来就该删、成品永久留本地。
+
+        另外排除两类"正在被处理"的文件：
+          · ``logs/pending_clean.json`` 里的（DMR 会按 24h 队列自己删）
+          · ``.temp/failed_uploads.json`` 里重试失败的（内容还没进云端）
+
+        返回 ``None`` 表示状态库不可用 —— 调用方必须放弃清理（宁可爆盘，
+        也不能因为读不到状态就把唯一副本删了）。
+        """
+        import sqlite3
+
+        db = p('logs', 'dmr_state.db')
+        if not os.path.exists(db):
+            logger.warning('磁盘紧急清理：找不到状态库，放弃自动清理（需人工处理）')
+            return None
+        try:
+            con = sqlite3.connect(f'file:{db}?mode=ro', uri=True, timeout=10)
+            try:
+                rows = con.execute(
+                    'SELECT artifact_id, kind, state, data FROM artifacts').fetchall()
+            finally:
+                con.close()
+        except Exception as e:                                   # noqa: BLE001
+            logger.warning(f'磁盘紧急清理：状态库读取失败（{e}），放弃自动清理')
+            return None
+
+        def norm(path):
+            try:
+                s = str(path or '')
+                if not s:
+                    return ''
+                if not os.path.isabs(s):
+                    s = os.path.join(p(), s)
+                return os.path.normcase(os.path.normpath(s))
+            except Exception:                                    # noqa: BLE001
+                return ''
+
+        dm = {}
+        src = {}
+        for aid, kind, state, raw in rows:
+            try:
+                data = json.loads(raw or '{}')
+            except Exception:                                    # noqa: BLE001
+                data = {}
+            parts = str(aid).rsplit(':', 2)
+            if len(parts) != 3:
+                continue
+            sid, _, idx = parts
+            if kind == 'dm_video':
+                dm[(sid, idx)] = (state, str(data.get('last_error') or ''))
+            elif kind == 'src_video':
+                key = norm(data.get('path'))
+                if key:
+                    src[key] = (sid, idx)
+
+        _skip_ok = ('跳过上传规则', '低于', '阈值', 'min_length', 'skip_upload',
+                    '过短', '时长')
+        out = {}
+        for path, key in src.items():
+            state, reason = dm.get(key, ('missing', ''))
+            if state == 'uploaded':
+                out[path] = '已上传'
+            elif state == 'skipped' and any(k in reason for k in _skip_ok):
+                out[path] = f'按规则跳过上传（{reason[:30]}）'
+
+        # 24h 队列里的、上传重试失败的，一律不动
+        protected = set()
+        q = p('logs', 'pending_clean.json')
+        try:
+            if os.path.exists(q):
+                with open(q, encoding='utf-8') as f:
+                    for entry in json.load(f) or []:
+                        for pair in entry.get('pairs') or []:
+                            for item in pair:
+                                if isinstance(item, str) and item:
+                                    protected.add(os.path.normcase(
+                                        os.path.basename(item.replace('\\', '/'))))
+        except Exception as e:                                   # noqa: BLE001
+            logger.warning(f'磁盘紧急清理：读取延迟清理队列失败（{e}），放弃自动清理')
+            return None
+        fu = os.path.join(TEMP, 'failed_uploads.json')
+        try:
+            if os.path.exists(fu):
+                with open(fu, encoding='utf-8') as f:
+                    data = json.load(f)
+                for task in (data.values() if isinstance(data, dict) else data):
+                    if not isinstance(task, dict):
+                        continue
+                    for key in ('video', 'src_video', 'file'):
+                        v = task.get(key)
+                        path = v.get('path') if isinstance(v, dict) else None
+                        if path:
+                            protected.add(os.path.normcase(
+                                os.path.basename(str(path).replace('\\', '/'))))
+        except Exception:                                        # noqa: BLE001
+            pass
+
+        for path in list(out):
+            if os.path.basename(path) in protected:
+                out.pop(path, None)
+        return out
+
     def emergency_clean(self, max_free_gb: float, logger=None) -> float:
         """删除「已经渲染出弹幕版」的最旧源视频，直到释放到目标水位。
 
@@ -318,6 +431,13 @@ class Maintenance:
         返回释放的 GB 数。
         """
         logger = logger or self.logger
+
+        # ⚠️ 先确认"哪些源真的可以删"。读不到状态库就完全不动手 ——
+        # 磁盘爆了还能人工腾空间，删掉唯一副本不可恢复。
+        removable = self._removable_sources(logger)
+        if removable is None:
+            return 0.0
+
         # 只扫源视频：新布局下就是 直播回放/原视频/；老布局（未迁移）退回
         # 直播回放/，那时必须显式跳过 弹幕版/ 分类目录和 <主播>（弹幕版）/。
         root = source_root()
@@ -357,6 +477,9 @@ class Maintenance:
                 except OSError:
                     continue
                 if time.time() - st.st_mtime < 7200:      # 2 小时内不动
+                    continue
+                key = os.path.normcase(os.path.normpath(os.path.abspath(path)))
+                if key not in removable:
                     continue
                 cands.append((st.st_mtime, path, st.st_size))
 

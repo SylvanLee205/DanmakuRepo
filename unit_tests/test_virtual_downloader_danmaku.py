@@ -58,6 +58,11 @@ class _VirtualTaskTestCase(DMRTestCase):
         task.logger = __import__('logging').getLogger('test')
         task.sess_id = 'sess-1'
         task.sess_videos = []
+        # 2026-11-16（审查报告 L-14）：find_files 增加了"同一文件只派发一次"的
+        # 去重集合与分段计数器，它们是 __init__/start_helper 里初始化的，
+        # 这里用 __new__ 造对象必须一并补上。
+        task._seen = {}
+        task._seg_no = 0
         return task
 
     def write(self, name, size_mb=1.0):

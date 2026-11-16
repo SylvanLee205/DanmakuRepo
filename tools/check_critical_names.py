@@ -15,6 +15,12 @@ import importlib
 import os
 import sys
 
+try:                                                             # GBK 控制台下 emoji 打印不崩
+    from _guard import ensure_utf8_stdout as _ensure_utf8
+    _ensure_utf8()
+except Exception:                                                # noqa: BLE001
+    pass
+
 PROD = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, PROD)
 os.chdir(PROD)

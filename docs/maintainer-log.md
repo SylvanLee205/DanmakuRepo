@@ -872,7 +872,7 @@ finally:
 
 ### 验证
 
-- 实测读剪贴板：修复前必崩，修复后正确返回 `'https://live.douyin.com/865102911165\r\n'`
+- 实测读剪贴板：修复前必崩，修复后正确返回 `'https://live.douyin.com/<房间号>\r\n'`
 - **连跑 20 次，0 失败**（原来"偶发"崩溃，必须靠重复验证）
 - 完整 `add_room.py --dry-run`：正常识别、正确跳过已存在房间、退出码 0
 - 新增 `unit_tests/test_add_room.py`（15 个测试）：
@@ -1028,3 +1028,298 @@ vvu 11-07 14:19   → 误命中 11-07 15:19
    所以运行期必须自己把状态收敛干净。
 4. 前缀匹配这类"猜长度"的模糊判断，在**文件名里含时间戳**的场景下几乎必错。
    要么严格同名，要么用能定位到唯一性的字段。
+
+---
+
+# 2026-11-16 · 时长闸门误杀完整成品（A-1/A-2）+ 两个配套修复
+
+起因：外部审查报告 `DMR审查报告-20261116` 指出「时长校验在误杀完整成品」。
+本会话先独立复验，确认成立后按用户要求修复。**上一轮体检里"闸门在正常拦截"
+的判断是错的**，这里一并更正。
+
+## A-1 根因：参考值是墙钟，产物是媒体时间轴
+
+`dmrender.py` 的闸门拿「弹幕最后时间戳 / `VideoInfo.duration` / 容器时长」当
+基准，这三个都含起流等待、卡顿、断流重连的空转时间；而渲染带
+`-fflags +genpts`，会把时间戳空洞压掉，产物时长对应的是**真正解码出来的画面**。
+
+ffprobe 实测三例（都是被判失败并删除的产物）：
+
+| 案例 | 容器跨度 | 可解码 | 产物 | 旧判定 | 事实 |
+|---|---|---|---|---|---|
+| vvu 11-07 14:19 | 3601s | 3060s | 3096s | 86% 删除 | 21 处缺口共 514s，产物完整 |
+| 君君 11-10 19:42 | 168.3s | 168.2s | 168s | 74% 删除 | 产物与源一秒不差 |
+| SFault 11-11 22:05 | 127.9s | 123.7s | 128s | 83% 删除 | 产物完整 |
+
+**修法**：新增 `FFprobe.get_media_duration()` —— 用
+`-show_entries packet=duration_time` 对视频包时长求和，得到可解码媒体时长。
+闸门先用廉价参考（墙钟/容器/弹幕）粗判，只有产物短于最大候选的 98% 才扫包
+（1 小时 4GB ts 实测 1.2 秒），判定式为 `缺口 > max(3s, 参考时长×10%)`。
+包时长求和还加了合理性闸（须落在容器跨度 30%~120%），否则退回弹幕/最小候选，
+避免 `duration_time` 大面积缺失时拿偏小数放过真截断。
+
+10-18 断尾人类那次（源 3791s、产物 2027s、53%）依然会被拦住：缺口 1764s ≫ 379s。
+
+## A-2 临时 ass 先删后读
+
+XML 弹幕转出的临时 `.ass` 在渲染结束的 `finally` 里删除，而原实现等到闸门里才
+读弹幕时间戳 → 永远读到"文件不存在"→ 返回 0 → 必然回退墙钟口径。
+改为 `_prepare_danmaku()` 之后立刻读一次存进 `dm_last_ts`。
+
+## P-1 `_has_danmaku` 缺 `@staticmethod`
+
+`Maintenance._has_danmaku(src_dir, dm_base)` 定义在类里却无 `self`，调用处写
+`self._has_danmaku(...)` → 必 `TypeError`。磁盘跌破 60G 时的紧急清理会 100%
+失效（当前剩 700G，所以一直休眠）。补装饰器。
+
+## A-3 `failed_renders.json` 按源视频去重
+
+原来只按 uuid 去重，同一分段反复失败会堆多条（实测 16 条里 5 组重复）。
+新增 `Render._video_key()`（`normcase + abspath`），加载时同一路径只留最新一条、
+写入时先顶掉旧条目，并把合并结果立刻落盘。
+
+配套两处收尾（同一根因：失败记录的"过期"没人清）：
+
+- **加载时**：`_output_looks_complete()` —— 产物存在且时长 ≥ 源可解码 90%，
+  说明这条"失败"是补派成功后的残留，直接丢弃（只对 output 存在的条目探测，
+  不增加常规启动开销）。
+- **渲染成功时**：`_gather` 清掉同源旧条目。补派走的是新 uuid，旧条目不会
+  自己被顶掉，界面会一直显示"失败"，手工重试等于白渲。
+
+实测：重启后从 10 条清到 5 条（余下 5 条产物确实不存在，属真失败）。
+
+## 验证
+
+- 新增 `unit_tests/test_render_duration_gate.py`（7 个用例）：三个误杀案例回放、
+  53% 真残缺必须拒绝、短片段 10% 容差边界、临时 ass 先读后删、去重落盘、
+  Windows 路径大小写不敏感。
+- 全量 **576 tests OK**（566 + 10，expected failures=5 为既有 xfail）。
+- 重启后实测：被误判的 5 个分段全部渲染成功（vvu 产物 3096s / 可解码 3060s），
+  时长闸门 0 次误杀；失败清单 10 → 5 条（清掉的全是"产物已完整落盘"的过期记录）。
+- `check_imports.py` / `check_undefined_names.py` 全部通过。
+- 修改前已备份 `.temp/failed_renders.json`，随后优雅重启验证。
+
+## 教训
+
+1. **两个时长含义不同，别用同一个词**。日志把墙钟 `duration` 标成"源文件容器时长"，
+   排查时极易误信 —— 这正是上一轮判断反了的直接原因。
+2. **测试要锁"判据"，不只是锁"流程"**。这次三个反例（86%/74%/83%）都发生在
+   闸门逻辑正确、参数不对的情况下，只有拿真实文件量出来的数字才能证伪。
+3. **先删后读的顺序错误会被"返回值 0"掩盖**。凡"读不到就返回 0/-1"的兜底，
+   都要问一句：这个 0 是"真的没有"，还是"文件已经没了"？
+
+---
+
+# 2026-11-16 · 审查报告全量修复（A/P/D/S/R/L 共 46 项）
+
+外部审查报告（`DMR审查报告-20261116.md`）列出 A-1~A-3、P-1~P-4、D-1~D-12、
+S-1~S-4、R-1~R-15、L-1~L-22 共 46 条。A-1/A-2/P-1/A-3 已于当日先行修复并验证
+（见上一节）。本节记录**其余 42 条**的处理，按"为什么必须改"分组，同型缺陷合并写。
+
+## 一、数据安全 / 红线（D 组 + P 组）
+
+| 条目 | 问题 | 修法 |
+|---|---|---|
+| P-2 | dryrun 的上传闸门值为 0（等于放行），且共享生产状态库、无单实例锁 | `DRYRUN_MIN_LENGTH=10**9` + 新增 `--allow-upload` 显式开关；独立状态库 `logs/dmr_state_dryrun.db`、独立目录 `直播回放-dryrun/`、独立互斥体 `Global\DanmakuRepo_DryRun`；`dmr.maintenance=None` |
+| P-3 | `cleanup_stale` 会把 `弹幕版/` 子目录里的成品删掉（红线） | 目录剪枝 `ds[:] = [d for d in ds if d != DANMAKU_SUBDIR]` + 文件名含 `DM_MARK` 直接跳过 |
+| P-4 | biliuprs 只看日志里有没有 bvid 判断上传成功，不看退出码 | `call_biliuprs` 返回 `(logfile, args, rc)`，`rc != 0` 即失败；`login()` 成功即 `return`；`islogin()` 改退出码 + 行首正则 |
+| D-1/D-2 | 多文件上传只保留最后一个状态；分片失败被无视后伪造 parts | 状态累积 + 失败 `break`；`as_completed` 逐个 `future.result()`，`failed or len(results) != chunks` 时 `return None` |
+| D-3 | `chunked_render` 拼接到 FINAL 前先删成品 | 拼到 `FINAL.partial.mp4`，解码校验通过后 `os.replace()` 原子替换 |
+| D-4 | `clean_sources` 只看"本地有 mp4"就删源 | 新增 `_state_map()` 读状态库，判据改为 `uploaded` 或 `skipped`+规则原因；队列缺失时 `return None`（不再返回空集）；`--apply` 删前重读队列 |
+| D-5 | `clean_confirmed_uploaded` 完全绕过 24h 队列 | `MIN_AGE_H 1.0 → 24.0`、读 `pending_clean.json` 保护、`--apply` 前 `require_not_running()`、`.ass` 也做年龄检查 |
+| D-6 | Cleaner 的弹幕版硬保护只拦 `delete`，move/copy/custom 全绕过 | 判据改成 `if is_dm_video_path(file.path)`，对所有 method 一律拒绝 |
+| D-7 | `migrate_layout` 在原始 JSON 文本上正则替换，制造非法转义 | 改为 `json.loads → _migrate_payload() → json.dumps`，坏 JSON 计数跳过 |
+| D-8 | `make_handover_bundle` 的 `_is_text` 恒真 → 把 git 二进制也当文本脱敏 | 去掉 `TEXT_SUFFIX` 尾部空串，新增 `_looks_text()`（读前 8KB 判 NUL）；`--with-configs` 真正生效并打警告 |
+| D-9 | `emergency_clean` 删源不看上传确认，可删正在渲染的源 | 新增 `_removable_sources()`：状态库确认 `uploaded`/`skipped`+规则原因才可删，并排除 `pending_clean.json` 与 `failed_uploads.json` 涉及的 basename；库不可用时整体放弃（`return 0.0`） |
+| D-10 | 非实时上传把未真正进入队列的分段标成 uploaded → 源被误删 | 按 `normcase(path)` 比对，只标记**实际进入 `up_videos`** 的槽位，并输出 `_marked`/`_dropped` 计数 |
+| D-11 | `skipped` 状态语义重载，恢复流程误当"可跳过" | reconciler 三处 `SKIPPED` → `FAILED`（文件校验未通过 / 丢弃中断产物 / stale 抛弃） |
+| D-12 | Config 清理兜底规则是 `delay: 0`（立即删源） | 兜底改为 `delay: 86400` |
+
+配套：`DMR/Cleaner/move.py` 的 `move2Trash` 返回值原来被忽略（回收站失败=静默永久删除），
+现在检查失败即抛 `RuntimeError`；同名目标自动加 `(n)` 后缀而不是静默覆盖。
+
+## 二、安全 / 隐私（S 组）
+
+| 条目 | 修法 |
+|---|---|
+| S-1 | WebUI 新增 `safe_config_name()`（拒绝 `/`、`..`、非 `.yml`），`config_edit`/`config_delete` 全部接入；`WebApi` 默认 `host=127.0.0.1`，默认口令 + 非 localhost 时**强制收窄**并 warning；`default.yml` 的 `webservice_kernel_args.host` 由 `0.0.0.0` 改回 `127.0.0.1` |
+| S-2 | `push_all.py` 新增 `SENSITIVE_PATTERNS`（Server酱 key / Tailscale IP / 抖音与 B 站房间号 / 手机号）+ `--allow-sensitive`/`--skip-scan`，命中即中止（退出码 2）。**并做了实际脱敏**：真实房间号 17 处 → 0 处（`tools/add_room.py`、2 个测试文件、5 篇文档） |
+| S-3 | `push_all.py` 的 `git push` 结果原来不检查，现在失败返回 `push_failed` 并以 1 退出 |
+| S-4 | `doctor.py --export` 新增 `_mask_config_text()`，**按行**掩码（保留 558 行注释、支持 `cookies: |` 块标量），cookie/token 类键不再外发 |
+
+## 三、无人值守可靠性（R 组）
+
+- **R-1 编码自保护**：32 个 `tools/*.py` 统一在 import 段后插入
+  `from _guard import ensure_utf8_stdout`（新建 `tools/_guard.py`，同时提供
+  `dmr_running()` 精确进程判断、`sqlite_backup()` 在线备份、`require_not_running()`）。
+  实测 `PYTHONIOENCODING=gbk` 下 doctor 不再崩。
+- **R-2** `Run_DMR.bat` / `Start_Render.bat` 的 `pause` 分支改为写
+  `logs\startup_error.log` 并 `exit /b 1`（session 0 下 `pause` = 永久挂起）。
+- **R-3** `render_only.py` 4 处裸 `input()` 改为 `_ask()`（无 tty 时用默认值）；
+  `check_env.py` 在非交互环境下直接抛 `EOFError` 而不是挂住。
+- **R-4** `logintools.bili_login` 的 `while not islogin()` 死循环 → `for attempt in range(1,6)`
+  + `proc.wait(timeout=180)`，失败抛 `RuntimeError`。
+- **R-5** `FFprobe.run_ffprobe` 增加 `timeout=60`，区分 `TimeoutExpired`；所有裸 `except`
+  改 `except Exception`。
+- **R-6** 新布局（`原视频/` + `弹幕版/`）下 6 个工具静默失效：`recover_part` /
+  `restore_dm_videos_from_cloud` / `audit_cloud` / `rename_orphans` / `health_check` 全部改走
+  `danmaku_dir_for()` 与 `直播回放/弹幕版/<主播>/`，老布局作为兜底保留。
+- **R-7** 自启锁 `LOCK_MAX_AGE 150 → 1800` 并加 30s 心跳（`os.utime`），
+  `restart_dmr.py` 现在也参与互斥（否则"我重启"与"守护拉起"会撞车）。
+- **R-8** 进程匹配从子串 `'main.py'` 改为正则 `(?i)(^|[\s"])main\.py([\s"]|$)` + 项目名过滤，
+  `stop_dmr` / `autostart_guard` / `post_boot_check` 同步修正（原来会误杀别人的 `main.py`）。
+- **R-9** `post_boot_check` 的 `DMR-2026*.log` 改 `DMR-*.log`、`netplwizard` 改 `netplwiz`、
+  任务数硬编码 `< 30` 改为按 `configs/DMR-*.yml` 计数（2027 年起不再假报警）。
+- **R-10** `backup_to_disk` 的 `d.upper() == proj_drive` 只比较首字母（`D` vs `D:` 永不等），
+  改为 `d[:2]`；`do_backup` 检查备份结果与 `verify()`，失败返回 1。
+- **R-11** `purge_task_state` 新增 `--force`，目标命中**在用任务**时默认拒绝；
+  备份改走 SQLite 在线备份 API。
+- **R-12** `test_hwdecode.py` 的"测试"不再直接改生产 `default.yml`，要 `--apply` 才落盘，
+  并保留原文件行尾风格。
+- **R-13** `gen_restart_notify.cd2_ok()` 换成 `cloud_ok()`：直接 `rclone lsd <dest>` 探真实
+  上传链路（15s 超时）。⚠️ **顺带纠正审查报告的前提**：CD2 服务其实还在跑
+  （`clouddrive.exe` PID 6772，19798 在监听），假告警的真正根因是 `_ps()` 在 session 0 下
+  调不到系统命令（即 R-14 的 PATH 问题），`_ps` 吞掉异常后返回空串 → 被解释成
+  "服务不存在"。改用 rclone 探活后不再依赖任何 shell/服务名。
+  同时修掉告警滞后：计数规则改为按间隔分流（间隔 < 2 分钟视为崩溃循环**照常计数**，
+  2~10 分钟按人工重启不计数），崩溃循环 30 秒内就能触发"频繁重启"提示。
+- **R-14** `_env.bat` 的 `endlocal & set "DMR_PY=%DMR_PY%"` 只导出解释器路径，
+  在 `setlocal` 里前缀的 System32 PATH 被一并还原 —— 于是 session 0 起的子进程
+  （rclone / ffmpeg / schtasks / net use）全部拿不到系统工具。改为
+  `endlocal & set "DMR_PY=%DMR_PY%" & set "PATH=%PATH%"`（同一行展开，取的是内层值）。
+  实测调用后 PATH 首段已是 `C:\WINDOWS\System32;...`，`where rclone` / `where ffmpeg` 均命中。
+- **R-15** `doctor.chk_tasks` 的 except 分支漏 `continue`（`r` 未绑定）。
+
+## 四、潜伏 bug（L 组）
+
+| 条目 | 问题与修法 |
+|---|---|
+| L-1 | 热加载任务不注入 `state_repo` → 该任务状态永不落库。`check_config_update` 的 new/updated 两处补 `_with_state_repo` |
+| L-2 | WebUI「重试失败任务」成功后状态机不收敛（旧 `request_id` 已不在 `wait` 里）。新增 `_retriable_requests`（失败请求 → 槽位）映射，`onRenderEnd`/`onUploadEnd` 匹配不到时按映射兜底认领 |
+| L-3 | 渲染被杀留下半截 mp4 → 分段永久卡死（ready 不重渲 + 时长闸门拒传）。`resume_recovered` 新增 `_dm_product_ok()`：mp4 探测时长 ≤0 即判残缺，删掉坏成品并留空槽位交回"待渲染"。**衍生修复**：`_passes_length_gate` 对 mp4 先补一次真实探测，把"重建对象没时长字段"和"文件真缺 moov"区分开 —— 实测救回一个 426MB 被误判 3 天的成品，重启后 1.7 秒上传完成 |
+| L-4 | `render_only` 的 `-1-(-1)=0<30` 让坏成品挡住重渲染。新增 `_safe_duration()`，任一 duration ≤ 0 都重渲 |
+| L-5 | `engine.start()` 用 `.values()` 解包 2 个变量 + `plugin_dict['name']` 字面量。改 `.items()` + `entry['status']` |
+| L-6 | `replaytask.add_event` 先 append 再无条件覆盖；list 型 trigger 会把 list 本身注册进去。改 `setdefault().append()`，`start()` 加 else 分支，重复 start 先清表 |
+| L-7 | `last_error` 被下一次状态写抹掉、`attempts` 每次 upsert 清零。改"None = 不改动（清空请传空串）"，并把 `attempts` 纳入 COALESCE 保留列表 |
+| L-8 | Render/Uploader 的 `stop()` 把**在跑**任务也抄进 `failed_tasks`（随后可能成功 → 人工重试=重复投稿）；Uploader 还无锁遍历 `_uploader_pool`。改为只收 `waiting` 任务 + 快照遍历 |
+| L-9 | `danmaku.py` 的 except 里引用未绑定变量 → `dm_filter` 缺键时整场录不上弹幕。预初始化 + 改 `.get()` |
+| L-10 | `safe_filename`/`rename_safe` 用未转义 glob 数个数，标题含 `[1]` 时返回**已存在**的名字（渲染 -y 直接覆盖成品）。新增 `_free_name()` 逐个 `exists()` 探测；pyrequests（2 处）、virtual_downloader 同型修复 |
+| L-11 | `recover_ffmpeg_segments` 弹幕配对忽略 Part 序号（Part001 抢走 Part000 的 ass）+ 时间戳差 1 秒就配不上 + `recovered` 含失败项。改为"时间戳 ±300s 容差 + Part 精确优先"排序，`recovered` 只收真正改名成功的 |
+| L-12 | `streamlink_sync` 用 `-reset_timestamps`（只属 segment muxer）配 `-f flv`，启动即失败；两个子进程 `stderr=PIPE` 全程不读 → 64KB 写满双向死锁。删该选项，stderr 各自重定向到独立临时文件（Windows 上父子共享 handle 会共享文件指针，必须开两份） |
+| L-13 | `pyrequests` 取流无 timeout，可永久挂死。加 `(10, 30)` 连接/读超时常量 `STREAM_TIMEOUT` |
+| L-14 | `virtual_downloader` 每 30 秒全量重扫，同一文件反复派发（重复渲染/上传 + `sess_videos` 无界增长）。按 `(文件名, mtime, size)` 去重，`segment_id` 改独立计数器，场次切换时重置 |
+| L-15 | `yutto._get_video` 只按后缀猜（.mkv 时 getsize 抛错）；`shutil.move` 后还 `listdir` 旧路径（整批已搬走却未登记）。补 `exists()` 判断、改 `listdir(new_dir)`、`rmtree` 加 `ignore_errors` |
+| L-16 | `Downloader/ffmpeg` 监控线程把 `readline().strip()` 的空结果当 EOF → 纯空白行就提前退出、15 秒后误判管道故障。改判原始 `raw == ''` |
+| L-17 | `stream_downloader` 的 stop/启动竞态产生孤儿 ffmpeg（stop 时 downloader 还是 None）。两个线程 start 前检查 `self.stoped`；`stop_once` 改用 `getattr(..., None)` |
+| L-18 | `biliwebapi.get_remote_data` 吞掉一切异常返回 None，"取数据异常沿用现有稿件"的三态保护成死代码 → 网络抖动被当"稿件已删除"→ 新建稿件、合集重复。改为：只有明确"不存在/不可见"（62002/640404/-404）才返回 None，其余抛异常 |
+| L-19 | `retry_failed_uploads` 补传不清洗 emoji（CD2 errno -7 但 exit 0 → 静默丢失）、用 `lsf` 字节核对（有幻影条目）、无视任务引擎一律传网盘。改用 `safe_remote_name`、`lsjson --stat` 直查对象、按任务 `upload_args` 分流 |
+| L-20 | `runcmd` 传字符串命令必 `UnboundLocalError`；`wait=True` 时 `stdout=PIPE` 不读 → 超缓冲死锁（Cleaner 的 `method: custom` 正走这条）。统一改走 `run_and_capture_output`（临时文件重定向） |
+| L-21 | `biliuprs.stop()` 的 `warninging` 拼写错误（AttributeError 被吞，发生在 kill 循环之前 → 有在传进程时一个都杀不掉）。改 `warning` |
+| L-22 | `audit_cloud.should_skip_upload` 自写一套跳过规则，与 DMR 语义不一致：`skip_require_landscape` 时把任意横屏都当"本该跳过" → 横屏真丢了也不报。改为直接 import 复用 `evaluate_upload_skip_rule` |
+
+## 五、验证
+
+- 全量 **578 tests OK**（含把 4 个记录 L-5/L-6 缺陷的 `@expectedFailure` 转成正常用例）。
+- `check_imports.py`：静态/运行时/真实清理三层 0 问题。
+- `check_undefined_names.py`：全部文件通过，6 个 `import *` 模块的运行时导入测试通过。
+- `doctor.py`：Python/依赖/ffmpeg/ffprobe/rclone/biliup/目录/配置/46 任务/状态库/磁盘/进程/
+  通知连通全部通过；唯一警告是沙箱禁止 `schtasks.exe` 导致计划任务查不到（权限问题，非代码问题）。
+- 优雅重启两次（`tools/restart_dmr.py`）：守护 1936→15544，DMR 8912/4140→13356/15520；
+  新日志对账 `错误 0 条`、`发现 7 个待恢复产物`、`已重新派发 1 个任务`，无 traceback。
+- 实测救回：`掉了颗兔牙-2026年11月03日00点20分(2)（弹幕版）.mp4`（426MB）
+  自 11-03 一直卡在 `rendered` 从未上传，L-3 衍生修复后重启即上传完成。
+
+## 六、经验
+
+1. **假告警要先证伪它的前提**。R-13 写着"CD2 已退役"，但 `clouddrive.exe` 其实在跑；
+   症状是真的（每次启动都报"服务不存在"），原因却在别处（`_ps()` 拿不到系统命令）。
+   改"判断依据"的优先级高于改"文案"。
+2. **同一个状态位承担两种语义，迟早在某条分支上出事**（`skipped` 既当"规则跳过"又当
+   "处理失败"）。发现这类重载，宁可新增状态也不要复用。
+3. **"读不到"必须区分"没有"和"失败"**。`glob` 数个数、`get_duration()` 返回 -1、
+   `_ps()` 返回空串 —— 这些"安静的兜底"是本次 42 条里出现频率最高的共同根因。
+
+---
+
+# 2026-11-16 晚 · 重启日志复核发现的两个真问题
+
+用户复查 17:10 那次重启的日志，问「每次重启之后的输出有没有问题」。复核后发现
+两处：一处是状态库早就停摆（不是重启引起的，但重启日志把症状暴露得很清楚），
+一处是重启日志里那句「7 个待恢复 → 已重新派发 1 个」背后的静默黑洞。
+
+## 一、状态库从 11-04 起就是空的
+
+`sessions` 表总共只有 30 条，时间分布是 11-01~11-03（26 条）+ 11-15~11-16（3 条），
+**11-04 到 11-15 完全空白**。而磁盘上有 449 个成品、云端一切正常。
+
+对照日志文件时间戳才看明白：`logs/DMR-20261103(2).log` 的 mtime 是 11-09 12:20，
+`logs/DMR-20261109.log` 的 mtime 是 11-16 09:21 —— DMR 这 13 天里**只重启过两次**，
+日志按启动日期命名，所以文件名看起来像"11-03 的日志"，实际一直写到 11-09。
+
+也就是说：状态库不是被谁清空的，是那段时间根本没写进去。这正是审查报告 L-1
+（热加载任务不注入 `state_repo`）的实证 —— 任务在内存里跑得好好的，录像、渲染、
+上传、清理全部正常，唯独"进度"这条线整体哑火。11-16 修掉 L-1 之后才开始恢复。
+
+危害：**没有任何数据丢失**（云端上传一直是成功的），但库里看到的进度与磁盘完全脱节，
+所有依赖状态库的判断（清理准入、恢复续跑、健康检查）在那 13 天里都是"看不见"的。
+
+## 二、「已重新派发 1 个」背后的静默黑洞
+
+原日志：
+
+```
+发现 7 个待恢复产物（已录制/已渲染但未完成处理）。
+恢复 3 个分段待处理（1cef1f31）。
+恢复 3 个分段待处理（24bc05fb）。
+已重新派发 1 个处理任务（渲染/上传）。
+```
+
+看着像"7 个里只有 1 个需要处理"，实际是 `_dispatch_pending_renders` 里这一行：
+
+```python
+if os.path.exists(output):
+    continue   # 已有成品，不重渲染
+```
+
+成品存在就 `continue`，**既不补记状态、也不补上传**。于是那 6 个（uu萌 11-15 ×3、
+忧郁敏 11-16 ×3，共 6.6GB）每次重启都被判成"待恢复"，每次又什么都不做，
+永远停在库里 `src_video=recorded`、`dm_video` 无记录。实测云端其实早就传上去了。
+
+修法（`_settle_existing_product`）：按「磁盘上确实有成品」这个事实把状态收敛掉，
+判据用 `logs/pending_clean.json` —— cleaner 只在上传确认之后才把源文件排进队列，
+所以它是"这一场确实传上去了"的持久化证据：
+
+- 队列里有这一场 → 直接标 `UPLOADED`（dm_video 与 src_video 一起），不重传；
+- 否则 → 标 `RENDERED`，交回同一轮的上传流程（rclone `copyto` 按 size+mtime 跳过相同文件）。
+
+源槽位也必须一起收敛，否则它一直是 `RECORDED`，下次重启仍被 resume 选中 ——
+只修 dm_video 等于没修（第一版就漏了这点，重启后日志原样复现，第二次才修对）。
+
+## 三、过程中自己引入并修掉的一个 bug
+
+第一次改完直接重启，日志立刻报：
+
+```
+恢复任务 uu萌 的产物失败：name 'vtype' is not defined
+  File "DMR/Task/liveevents.py", line 362, in _dispatch_pending_renders
+```
+
+`_dispatch_pending_renders` 的循环变量是 `sv`/`dv`，**没有 `vtype`**（它专判
+dm_video 槽位）。578 个测试当时全绿，因为没有任何用例走过"成品已存在"这条分支。
+现已补 3 个用例（`TestSettleExistingProduct`），其中一条专门断言"成品存在时不再派渲染、
+但必须补记产物"，正是为了挡住这类"测试覆盖不到的分支里手滑"。
+
+## 四、验证
+
+- 收敛前：每次重启「发现 6 个待恢复产物 → 已重新派发 0 个任务」
+- 收敛后：`状态已对齐：…（弹幕版）.mp4 早前已上传（待删清单可证），补记为 uploaded` ×6
+- 再重启一次：日志里**不再出现「待恢复」**，`对账完成 … 待恢复 0 项，错误 0 条`，
+  全程 0 error / 0 warning
+- 库内核对：`1cef1f31` / `24bc05fb` 两个场次的 12 条产物全部 `uploaded`
+- 全量 **581 tests OK**（较上一轮 +3）
+
+## 五、经验
+
+**"每次重启都打印同一句话"本身就是缺陷信号。** 恢复流程是幂等的才对——真收敛了，
+第二次重启就不该再看见它。看到「发现 N 个待恢复」重复出现，先怀疑状态没写回去，
+而不是怀疑那几个文件还有问题。

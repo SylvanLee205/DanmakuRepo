@@ -81,6 +81,21 @@ def load_stop_dmr():
     return mod
 
 
+def load_autostart_launch():
+    """按文件路径加载 tools/autostart_launch.py，复用它的自启互斥锁。
+
+    2026-11-16：restart 原来完全不参与自启锁。停止与拉起之间有几十秒空档，
+    这期间 DMR_SessionWatch / 登录自启可能再拉一个守护进来 —— 两边各停一次、
+    各起一次，败者每 10 秒重拉、exit 3 刷日志。共用同一把锁即可避免。
+    """
+    import importlib.util
+    path = os.path.join(PROJECT_ROOT, 'tools', 'autostart_launch.py')
+    spec = importlib.util.spec_from_file_location('_dmr_autostart_lock', path)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
 def explorer_exe() -> str:
     """explorer.exe 的绝对路径（它在 %SystemRoot% 下，不在 System32）。"""
     root = os.environ.get('SystemRoot') or r'C:\Windows'
@@ -97,8 +112,32 @@ def hr(title=''):
 
 
 def main() -> int:
+    # 2026-11-16：本脚本没有 argparse，过去任何参数都被静默忽略 ——
+    # 敲 `restart_dmr.py --help` 会**真的重启一遍**。这里显式拦掉帮助类参数。
+    if any(a in ('-h', '--help', '/?') for a in sys.argv[1:]):
+        print(__doc__ or '')
+        print('用法: python tools\\restart_dmr.py [--dry-run] [--force]')
+        print('  --dry-run  只打印将要做什么，不动任何进程')
+        print('  --force    硬停（不等正在录制的分段收尾）')
+        return 0
+
     st = load_stop_dmr()
     UP = PROJECT_ROOT
+
+    # 与自启/守护脚本共用一把锁：避免"我在重启"和"守护在拉起"撞车。
+    _lock_holder = None
+    if not DRY_RUN:
+        try:
+            import atexit
+            _lock_holder = load_autostart_launch()
+            if not _lock_holder.acquire_lock():
+                print('  ❌ 另一个自启/守护流程正在持锁，已中止重启'
+                      '（避免双 stop / 双 start）。稍等一分钟再试。')
+                return 1
+            atexit.register(_lock_holder.release_lock)
+        except Exception as e:                                   # noqa: BLE001
+            print(f'  ⚠️ 自启锁不可用（{e}），继续重启。')
+            _lock_holder = None
 
     hr('1. 当前状态')
     st.show_state('重启前')

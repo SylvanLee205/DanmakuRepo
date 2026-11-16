@@ -3,6 +3,12 @@ import warnings
 import sys
 import subprocess
 
+try:                                                             # GBK 控制台下 emoji 打印不崩
+    from _guard import ensure_utf8_stdout as _ensure_utf8
+    _ensure_utf8()
+except Exception:                                                # noqa: BLE001
+    pass
+
 __all__ = ('check_pypi',)
 
 def compare_version(ver1, ver2):
@@ -48,6 +54,13 @@ def check_pypi():
         #    main.py **还没配置日志**，表现为"程序根本没起、连一行日志都没有"。
         #    现在：交互终端仍然提示自动安装；非交互则写诊断文件 + 退出码 2。
         try:
+            # 2026-11-16：只有"真的有人在按键"才提示。有控制台但无人值守
+            # （bat 里双击后离开、CI、远程会话）时 isatty() 仍为 True，
+            # input() 会永久阻塞 —— 这里额外用环境变量做兜底开关。
+            import os as _os
+            if (_os.environ.get('DMR_NONINTERACTIVE')
+                    or sys.stdin is None or not sys.stdin.isatty()):
+                raise EOFError('非交互环境，不等待回车')
             input('Python 包未正确安装，回车自动安装:')
         except EOFError:
             _msg = (f'缺少 Python 依赖（{_imp_err}），且当前无控制台无法交互安装。\n'

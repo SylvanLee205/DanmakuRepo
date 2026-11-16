@@ -39,6 +39,12 @@ import sys
 import time
 import zipfile
 
+try:                                                             # GBK 控制台下 emoji 打印不崩
+    from _guard import ensure_utf8_stdout as _ensure_utf8
+    _ensure_utf8()
+except Exception:                                                # noqa: BLE001
+    pass
+
 PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
 #: 整个目录不进包
@@ -65,7 +71,7 @@ _PATTERNS = [
 
 TEXT_SUFFIX = ('.py', '.md', '.yml', '.yaml', '.json', '.txt', '.cfg', '.ini',
                '.bat', '.cmd', '.ps1', '.xml', '.html', '.css', '.js', '.sh',
-               '.sql', '.toml', '')
+               '.sql', '.toml')
 
 
 def _mask(text: str) -> str:
@@ -75,7 +81,32 @@ def _mask(text: str) -> str:
 
 
 def _is_text(name: str) -> bool:
+    """按**后缀**判断是否文本。用于 zip 内条目（只有名字，没有内容可读）。
+
+    ⚠️ 2026-11-16 修正（审查报告 D-8）：原来元组末尾有个空串 ``''``，
+    而 ``str.endswith('')`` 恒为 True —— 于是 ``.git/objects/*.pack``、
+    ``.ico``、``.exe`` 全被当成文本 ``decode(errors='replace')``，
+    所有字节变成 U+FFFD，交接包里的 git 历史克隆出来就是坏的。
+    """
     return name.lower().endswith(TEXT_SUFFIX)
+
+
+def _looks_text(path: str) -> bool:
+    """按**真实文件**判断是否该走脱敏：后缀命中即文本；无后缀看内容。
+
+    无后缀文件（Dockerfile、LICENSE、git hooks）不一律当二进制，
+    也不一律当文本 —— 读前 8KB，含 NUL 字节就当二进制原样复制。
+    """
+    if _is_text(path):
+        return True
+    if os.path.splitext(path)[1]:
+        return False
+    try:
+        with open(path, 'rb') as f:
+            head = f.read(8192)
+    except OSError:
+        return False
+    return b'\x00' not in head
 
 
 def _skip_dir(rel: str) -> bool:
@@ -151,7 +182,12 @@ def _recent_logs():
 
 
 def _config_files(with_configs):
-    """任务配置：默认脱敏后加入包。"""
+    """任务配置：默认**脱敏**后加入包。
+
+    ``--with-configs`` 的含义是"带完整配置（不脱敏）"，供接手者直接跑起来。
+    原实现两个分支返回同一个列表，``--with-configs`` 是空操作 —— 现在真的
+    切换 do_mask。
+    """
     cfgdir = os.path.join(PROJECT_ROOT, 'configs')
     if not os.path.isdir(cfgdir):
         return []
@@ -160,13 +196,11 @@ def _config_files(with_configs):
         p = os.path.join(cfgdir, fn)
         if not os.path.isfile(p):
             continue
-        if fn in ('global.yml', 'global.yaml'):
-            out.append((p, f'configs/{fn}', True))
-        elif fn.endswith(('.yml', '.yaml')):
+        if fn in ('global.yml', 'global.yaml') or fn.endswith(('.yml', '.yaml')):
             out.append((p, f'configs/{fn}', True))
     if not with_configs:
         return out
-    return out
+    return [(p, rel, False) for p, rel, _ in out]
 
 
 def build(out_path, include_git=True, with_logs=False, with_configs=False,
@@ -189,7 +223,7 @@ def build(out_path, include_git=True, with_logs=False, with_configs=False,
             except OSError as e:
                 print(f'  [跳过] {arcname}: {e}')
                 return
-            if do_mask and mask and _is_text(src):
+            if do_mask and mask and _looks_text(src):
                 try:
                     text = data.decode('utf-8')
                 except UnicodeDecodeError:
@@ -231,7 +265,7 @@ def build_dir(out_dir, include_git=True, with_logs=False, with_configs=False,
         os.makedirs(os.path.dirname(dst), exist_ok=True)
         with open(src, 'rb') as f:
             data = f.read()
-        if mask and do_mask and _is_text(src):
+        if mask and do_mask and _looks_text(src):
             data = _mask(data.decode('utf-8', errors='replace')).encode('utf-8')
         with open(dst, 'wb') as f:
             f.write(data)
@@ -296,6 +330,10 @@ def main():
     ap.add_argument('--no-mask', action='store_true',
                     help='不脱敏（只在完全信任接收方时用）')
     args = ap.parse_args()
+
+    if args.with_configs:
+        print('⚠️ --with-configs 会带上**不脱敏**的配置（含 cookie/key/房间号），'
+              '只应交付给完全可信的接手方。')
 
     stamp = time.strftime('%Y%m%d-%H%M')
     if args.out_dir:

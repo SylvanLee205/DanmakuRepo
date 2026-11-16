@@ -5,6 +5,7 @@ import logging
 PROGRESS = 25
 if logging.getLevelName(PROGRESS) != 'PROGRESS':
     logging.addLevelName(PROGRESS, 'PROGRESS')
+import json
 import os
 import time
 from .baseevents import BaseEvents
@@ -16,7 +17,7 @@ from ..state import (
     rebuild_video_info,
 )
 from ..utils import *
-from ..paths import danmaku_dir_for
+from ..paths import DM_MARK, danmaku_dir_for
 
 #: 内存状态槽位（``state_dict`` 的 ``vtype``）到持久化产物种类的映射。
 #: 槽位名沿用 ``VideoInfo.dtype`` 的历史命名，产物种类则是持久化层的枚举。
@@ -69,6 +70,13 @@ class LiveEvents(BaseEvents):
         self._notify_last: dict = {}
         #: 是否已经见过这场直播的"开始"（供将来恢复下播通知时用）
         self._seen_end: bool = False
+        #: 已判失败但仍然可能被"重试"救回来的请求：request_id -> (group_id, vtype, idx)
+        #: 2026-11-16 新增（审查报告 L-2）。WebUI 点重试时，渲染/上传插件拿的是
+        #: **原来的 task**（request_id 不变），而 onTaskError 早已把它从 wait 里
+        #: 摘掉了 —— 重试成功后 onRenderEnd/onUploadEnd 在 wait 里找不到人，
+        #: 状态永远停在 failed，也不会触发后续上传/清理（渲染重试成功但成品
+        #: 永不上传，DB 永远 failed）。这里留一份映射供结果回调兜底认领。
+        self._retriable_requests: dict = {}
 
     @property
     def event_dict(self):
@@ -339,7 +347,20 @@ class LiveEvents(BaseEvents):
                 self.logger.warning(f'计算弹幕版输出路径失败，跳过 {video.path}: {e}')
                 continue
             if os.path.exists(output):
-                continue   # 已有成品，不重渲染
+                # 2026-11-16 修（本轮重启实测发现）：原来这里直接 continue，
+                # 于是「成品已在磁盘、但状态库没有 dm_video 记录」的分段会卡在缝里 ——
+                # 每次重启都被判成"待恢复"，却既不补记状态也不补上传。
+                # 实测 6 段共 6.6GB（uu萌 11-15 ×3、忧郁敏 11-16 ×3）就这样滞留：
+                # 云端其实早就传上去了，库里却停在 src_video=recorded、dm_video 无记录，
+                # 日志永远打印「发现 N 个待恢复产物 → 已重新派发 1 个任务」。
+                #
+                # 现在按「磁盘上确实有成品」这个事实把状态收敛掉：
+                #   · 待删清单里已有这一场（cleaner 只在上传确认后才排队）
+                #     → 直接标 UPLOADED，不重传；
+                #   · 否则标 READY，交给同一轮的 _check_for_upload 补传
+                #     （rclone copyto 按 size+mtime 跳过相同文件，代价可控）。
+                self._settle_existing_product(group_id, 'dm_video', idx, output)
+                continue
             render_msg = PipeMessage(
                 source=self.name,
                 target='render',
@@ -363,6 +384,90 @@ class LiveEvents(BaseEvents):
             msgs.append(render_msg)
             self.logger.info(f'补派渲染：{os.path.basename(video.path)}')
         return msgs
+
+    # ── 「成品已在磁盘、但库里没有记录」的收敛 ────────────────────────────
+    #
+    # 2026-11-16 实测背景：DMR 从 11-09 连续运行到 11-16，期间状态库实际上
+    # 一条 session 都没写进去（库里 sessions 停在 11-03，11-04~11-15 全空白），
+    # 于是这 7 天渲染出来、并且**已经成功上传到网盘**的成品，在库里完全没有
+    # dm_video 记录，src_video 也停在 recorded。
+    #
+    # 后果不是数据丢失（云端都在），而是状态永不收敛：每次重启都会把这些分段
+    # 当成「待恢复」重新走一遍，打印「发现 N 个待恢复产物」，然后因为成品已存在
+    # 而一个都不派发 —— 日志看起来"只派发 1 个"，实际上另外 6 个本来就是做完的。
+    # 更麻烦的是没有记录的成品不会被清理流程判定，本地空间只增不减。
+
+    def _confirmed_upload_stems(self) -> set:
+        """已经「确认上传过」的源文件 stem 集合。
+
+        ``logs/pending_clean.json`` 是 cleaner 的延迟清理队列，**只有上传确认之后**
+        才会把源文件排进去。因此它是"这一场确实传到云端了"的持久化证据，
+        重启后用它区分"成品已做完"和"成品刚做好还没传"，避免重复上传 GB 级文件。
+        """
+        cache = getattr(self, '_confirmed_stems_cache', None)
+        if cache is not None:
+            return cache
+        stems = set()
+        try:
+            root = os.path.dirname(os.path.dirname(
+                os.path.dirname(os.path.abspath(__file__))))
+            p = (getattr(self, '_pending_clean_path', None)
+                 or os.path.join(root, 'logs', 'pending_clean.json'))
+            if os.path.exists(p):
+                with open(p, 'r', encoding='utf-8') as f:
+                    entries = json.load(f)
+                for entry in (entries if isinstance(entries, list) else []):
+                    if not isinstance(entry, dict):
+                        continue
+                    for pair in (entry.get('pairs') or []):
+                        items = pair if isinstance(pair, (list, tuple)) else [pair]
+                        for item in items:
+                            if not item:
+                                continue
+                            stems.add(os.path.splitext(
+                                os.path.basename(str(item)))[0])
+        except Exception as e:
+            # 读不出来只是少了一个优化，不能影响恢复流程
+            self.logger.debug(f'读待删清单失败（不影响恢复）：{type(e).__name__}: {e}')
+        self._confirmed_stems_cache = stems
+        return stems
+
+    def _settle_existing_product(self, group_id, vtype, idx, output) -> None:
+        """成品已在磁盘上：把状态收敛成终态，别让它在每次重启时反复"待恢复"。"""
+        seg_no = self._seg_no(group_id, vtype, idx)
+        stem = os.path.splitext(os.path.basename(output))[0]
+        # 成品名是「源名 + （弹幕版）」；待删清单记的是源文件名，去掉标记再比
+        src_stem = stem.replace(DM_MARK, '')
+        uploaded = src_stem in self._confirmed_upload_stems()
+        group = self.state_dict.get(group_id) or []
+        slot = group[idx].get(vtype) if idx < len(group) else None
+        if slot is not None:
+            slot['status'] = 'uploaded' if uploaded else 'ready'
+            slot['file'] = output
+        self._sync_artifact(
+            group_id, vtype, seg_no, path=output,
+            state=(ArtifactState.UPLOADED if uploaded else ArtifactState.RENDERED))
+        if uploaded:
+            # 源视频自己也收敛到 UPLOADED：它的"处理完成"就是弹幕版进了稿件。
+            # 不收敛的话 src_video 会一直是 RECORDED，每次重启仍被 resume 选中，
+            # 日志永远重复「发现 N 个待恢复产物」——等于没修。
+            # 顺带让维护脚本的 emergency_clean（要求 uploaded 才可删）能接手，
+            # 本地空间才有机会释放。
+            src_slot = group[idx].get('src_video') if idx < len(group) else None
+            if src_slot is not None and src_slot.get('status') in (None, 'ready',
+                                                                  'recorded'):
+                src_slot['status'] = 'uploaded'
+                self._sync_artifact(
+                    group_id, 'src_video',
+                    self._seg_no(group_id, 'src_video', idx),
+                    state=ArtifactState.UPLOADED)
+            self.logger.info(
+                f'状态已对齐：{os.path.basename(output)} 早前已上传'
+                f'（待删清单可证），补记为 uploaded。')
+        else:
+            self.logger.info(
+                f'成品已存在但无上传记录，补记为 rendered 并交回上传流程：'
+                f'{os.path.basename(output)}')
 
     def resume_recovered(self, artifacts) -> list:
         """把对账收集出的"已录制/已渲染但未完成处理"的产物**重新送回处理链**。
@@ -426,6 +531,16 @@ class LiveEvents(BaseEvents):
             while len(group) <= index:
                 group.append(self._blank_segment_state())
             vtype = _KIND_TO_VTYPE.get(artifact.kind, 'src_video')
+            # 2026-11-16 修（审查报告 L-3）：渲染被中途杀掉时，磁盘上留的是
+            # 半截 mp4（没有 moov，时长读不出来）。原来这里无条件标 ready，
+            # 于是走进一条死路：
+            #   _dispatch_pending_renders 见 ready → 不重渲
+            #   _passes_length_gate 见 mp4 时长不可读 → 拒传
+            #   上传不成功 → 源文件永不清理 → 每次重启重复同一死路。
+            # 现在先校验成品完整性：不完整就删掉并留空槽位，交回"待渲染"路径。
+            if vtype == 'dm_video' and not self._dm_product_ok(video):
+                self._discard_broken_render(artifact, video)
+                continue
             group[index][vtype].update({'status': 'ready', 'file': video})
             if item.session_id not in touched_groups:
                 touched_groups.append(item.session_id)
@@ -501,6 +616,62 @@ class LiveEvents(BaseEvents):
         except Exception as e:
             self.logger.warning(f'读取 recovery.min_valid_size_mb 失败：{e}')
             return 30.0
+
+    def _dm_product_ok(self, video) -> bool:
+        """恢复出的**弹幕版成品**是否可信（是不是渲染被打断留下的半截文件）。
+
+        2026-11-16 新增（审查报告 L-3）。判据刻意选"时长能不能读出来"：
+
+        * 正常收尾的 mp4 一定写了 moov，``FFprobe`` 必然读得出时长；
+        * 读不出时长只可能是"进程被中途杀掉、索引没落盘"（moov atom not found）。
+
+        只对 mp4/mov/m4v 做这个判断（本程序渲染固定输出 mp4）；其它容器一律信任，
+        也**不在探测本身出错时判坏**（例如环境里没有 ffprobe）。
+        """
+        path = getattr(video, 'path', None)
+        if not path or not os.path.exists(path):
+            return True   # 路径问题交给上层"文件不存在"那条路径，不在这里判坏
+        if os.path.splitext(path)[1].lower() not in ('.mp4', '.mov', '.m4v'):
+            return True
+        try:
+            duration = FFprobe.get_media_duration(path)
+        except Exception as e:
+            self.logger.debug(f'探测 {path} 时长失败，按可信处理：{e}')
+            return True
+        try:
+            duration = float(duration)
+        except (TypeError, ValueError):
+            return False
+        return duration > 0
+
+    def _discard_broken_render(self, artifact, video) -> None:
+        """删除不完整的弹幕版成品，并把该产物记为失败（等重新渲染）。"""
+        path = getattr(video, 'path', None)
+        self.logger.warning(
+            f'恢复出的弹幕版成品不完整（渲染被中断，读不出时长）：{path}；'
+            f'已删除并重新派发渲染。')
+        try:
+            if path and os.path.exists(path):
+                os.remove(path)
+        except Exception as e:
+            self.logger.warning(f'删除不完整成品失败 {path}: {e}')
+        try:
+            self.state_repo.set_artifact_state(
+                artifact.artifact_id, ArtifactState.FAILED,
+                last_error='渲染被中断，成品不完整，已重新派发渲染')
+        except Exception as e:
+            self.logger.debug(f'标记产物 {artifact.artifact_id} 状态失败：{e}')
+
+    def _retriable_map(self) -> dict:
+        """「失败请求 → 槽位」映射（延迟初始化）。
+
+        不直接在 ``__init__`` 里硬用：单元测试与极少数代码路径会用
+        ``__new__`` 造对象（不跑 ``__init__``），这里兜一层避免 AttributeError。
+        """
+        m = getattr(self, '_retriable_requests', None)
+        if m is None:
+            m = self._retriable_requests = {}
+        return m
 
     def _handle_unusable(self, artifact, item) -> None:
         """处置"大小不足以继续处理"的产物（文件太小，或文件已不存在）。
@@ -815,6 +986,24 @@ class LiveEvents(BaseEvents):
         # FLV 容器），收尾不规范、时长本来就常读不出，靠大小兜底是合理的。
         _ext = os.path.splitext(str(getattr(video, 'path', '') or ''))[1].lower()
         if _ext in ('.mp4', '.mov', '.m4v'):
+            # 2026-11-16（审查报告 L-3 衍生）：光看"内存里的 duration 为空"就判坏
+            # 会误伤 —— 重启后从状态库重建的 VideoInfo 本来就没有时长字段
+            # （库里的 duration 常为空），文件其实是好的。
+            # 这里补一次真实探测，把"数据缺失"和"文件残缺"区分开：
+            #   · 探测能读出时长 → 好文件，按 min_length 正常判断
+            #   · 探测读不出      → 缺 moov 的残缺成品，拒绝上传（需重渲）
+            _probed = 0.0
+            try:
+                _probed = float(FFprobe.get_media_duration(video.path))
+            except Exception as e:
+                self.logger.debug(f'补探 {video.path} 时长失败：{e}')
+            if _probed > 0:
+                video.duration = _probed
+                if _probed < min_length:
+                    self.logger.info(
+                        f'视频{video.path}时长为{_probed:.0f}s，设置{min_length}s，跳过上传。')
+                    return False
+                return True
             self.logger.error(
                 f'视频{video.path}读不出时长（渲染产物缺索引，多半是被中途终止的'
                 f'残缺文件），跳过上传 —— 需要重新渲染。')
@@ -978,11 +1167,35 @@ class LiveEvents(BaseEvents):
                                 }
                             )
                             # 标记状态信息
-                            for idx, _ in enumerate(self.state_dict[group_id]):
-                                self.state_dict[group_id][idx][vtype]['status'] = 'uploading'
-                                self.state_dict[group_id][idx][vtype]['wait'].append(upload_msg.request_id)
-                                self._sync_artifact(group_id, vtype, self._seg_no(group_id, vtype, idx),
-                                                    state=ArtifactState.UPLOADING)
+                            # ⚠️ 2026-11-16：只标记**实际进入 up_videos** 的分段。
+                            #    原实现遍历 state_dict 全部槽位无条件标 uploading，
+                            #    连被 min_length 过滤掉的分段也挂上了 wait →
+                            #    onUploadEnd 把它们一起标 uploaded → 24h 后删源，
+                            #    而那些分段**从未上传**，源是唯一副本。
+                            _up_keys = {
+                                os.path.normcase(str(getattr(v, 'path', v)))
+                                for v in up_videos
+                            }
+                            _marked = 0
+                            for idx, _vs in enumerate(self.state_dict[group_id]):
+                                _f = _vs.get(vtype, {}).get('file')
+                                if _f is None:
+                                    continue
+                                _k = os.path.normcase(str(getattr(_f, 'path', _f)))
+                                if _k not in _up_keys:
+                                    continue
+                                _vs[vtype]['status'] = 'uploading'
+                                _vs[vtype]['wait'].append(upload_msg.request_id)
+                                self._sync_artifact(
+                                    group_id, vtype,
+                                    self._seg_no(group_id, vtype, idx),
+                                    state=ArtifactState.UPLOADING)
+                                _marked += 1
+                            _dropped = len(up_videos) - _marked
+                            if _dropped > 0:
+                                self.logger.warning(
+                                    f'{self.name}: {_dropped} 个待上传分段未在状态槽中找到'
+                                    f'（不标记上传，源文件保留）。')
                             self._sync_upload_group(group_key, arg)
                             ret_msgs.append(upload_msg)
 
@@ -1036,9 +1249,11 @@ class LiveEvents(BaseEvents):
             # 拼接（``ret_msgs += func(msg)``），返回 None 会抛 TypeError。
             return []
         # 将状态信息中request_id对应的等待移除
+        matched = False
         for idx, video_state in enumerate(video_states):
             for vtype, info in video_state.items():
                 if request_id in info['wait']:
+                    matched = True
                     self.state_dict[video.group_id][idx][vtype]['wait'].remove(request_id)
                     if len(self.state_dict[video.group_id][idx][vtype]['wait']) == 0:
                         self.state_dict[video.group_id][idx][vtype]['status'] = 'ready'
@@ -1047,6 +1262,26 @@ class LiveEvents(BaseEvents):
                         self._sync_artifact(video.group_id, vtype, self._seg_no(video.group_id, vtype, idx),
                                             path=video,
                                             state=ArtifactState.RENDERED)
+
+        # 2026-11-16 修（审查报告 L-2）：WebUI「重试失败任务」走的是插件
+        # retry_task，重投的 task 带着旧 request_id，而 onTaskError 已经把它从
+        # wait 里摘掉 → 上面的循环一个都匹配不上，重试成功也白搭（状态停在
+        # failed、不上传、不清理）。这里用失败时记下的映射兜底认领。
+        if not matched and request_id is not None:
+            adopted = self._retriable_map().pop(request_id, None)
+            if adopted is not None:
+                _gid, _vtype, _idx = adopted
+                _states = self.state_dict.get(_gid) or []
+                if 0 <= _idx < len(_states) and _vtype in _states[_idx]:
+                    slot = _states[_idx][_vtype]
+                    slot['wait'] = []
+                    slot['status'] = 'ready'
+                    slot['file'] = video
+                    self.logger.info(
+                        f'{self.name}: 重试成功，{_vtype} 状态由 failed 修正为 ready'
+                        f'（{getattr(video, "path", "?")}）')
+                    self._sync_artifact(_gid, _vtype, self._seg_no(_gid, _vtype, _idx),
+                                        path=video, state=ArtifactState.RENDERED)
         
         ret_msgs = []
         if self.config['common_event_args'].get('auto_upload'):
@@ -1202,16 +1437,35 @@ class LiveEvents(BaseEvents):
         self.logger.log(PROGRESS, f'{self.name}: {message.msg}.')
         request_id = message.request_id
         # 将状态信息中request_id对应的等待移除
+        matched = False
         for group_id, video_states in self.state_dict.items():
             for idx, video_state in enumerate(video_states):
                 for vtype, info in video_state.items():
                     if request_id in info['wait']:
+                        matched = True
                         self.state_dict[group_id][idx][vtype]['wait'].remove(request_id)
                         if len(self.state_dict[group_id][idx][vtype]['wait']) == 0:
                             self.state_dict[group_id][idx][vtype]['status'] = 'uploaded'
                             # 全部待处理请求都结束了 → 该产物确实已进稿件
                             self._sync_artifact(group_id, vtype, self._seg_no(group_id, vtype, idx),
                                                 state=ArtifactState.UPLOADED)
+
+        # 2026-11-16 修（审查报告 L-2）：与 onRenderEnd 同理 —— WebUI 重试上传
+        # 成功后，旧 request_id 已不在 wait 里，不兜底的话状态永远是 failed，
+        # 清理逻辑（要求 uploaded）也不会接手，源文件白占磁盘。
+        if not matched and request_id is not None:
+            adopted = self._retriable_map().pop(request_id, None)
+            if adopted is not None:
+                _gid, _vtype, _idx = adopted
+                _states = self.state_dict.get(_gid) or []
+                if 0 <= _idx < len(_states) and _vtype in _states[_idx]:
+                    slot = _states[_idx][_vtype]
+                    slot['wait'] = []
+                    slot['status'] = 'uploaded'
+                    self.logger.info(
+                        f'{self.name}: 重试上传成功，{_vtype} 状态由 failed 修正为 uploaded。')
+                    self._sync_artifact(_gid, _vtype, self._seg_no(_gid, _vtype, _idx),
+                                        state=ArtifactState.UPLOADED)
         
         ret_msgs = []
         if self.config['common_event_args'].get('auto_clean'):
@@ -1382,6 +1636,16 @@ class LiveEvents(BaseEvents):
                             prev_status = info.get('status')
                             info['status'] = 'failed'
                             failed_slots.append((group_id, vtype, idx, prev_status))
+                            # 留一份"失败请求 → 槽位"映射：WebUI 点重试时插件会用
+                            # **同一个 request_id** 重投，而那时它已不在 wait 里了
+                            # （审查报告 L-2，见 onRenderEnd/onUploadEnd 的兜底）。
+                            if request_id is not None:
+                                _retriable = self._retriable_map()
+                                _retriable[request_id] = (group_id, vtype, idx)
+                                # 只保留最近 500 条，防止长期运行无限增长
+                                if len(_retriable) > 500:
+                                    for _k in list(_retriable)[:100]:
+                                        _retriable.pop(_k, None)
                             self.logger.warning(
                                 f'{self.name}: {vtype} 标记为 failed（任务失败，不再等待），'
                                 f'文件: {getattr(info.get("file"), "path", "?")}'

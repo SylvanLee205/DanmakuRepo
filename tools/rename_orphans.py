@@ -80,7 +80,9 @@ def dmr_running():
         try:
             if (p.info['name'] or '').lower() != 'python.exe':
                 continue
-            if any('main.py' in (a or '') for a in (p.info['cmdline'] or [])):
+            # 2026-11-16：`'main.py' in arg` 会命中 domain.py，改成精确 basename
+            if any(os.path.basename(str(a)).lower() == 'main.py'
+                   for a in (p.info['cmdline'] or [])[1:]):
                 return True
         except Exception:
             continue
@@ -100,10 +102,18 @@ def scan():
     """
     ok, no_dm = [], []
     now = time.time()
-    for room in sorted(os.listdir(REPLAY)):
-        rdir = os.path.join(REPLAY, room)
-        if not os.path.isdir(rdir):
-            continue
+    # 2026-11-16：新布局下源视频在 直播回放/原视频/<主播>/。原实现直接遍历
+    # REPLAY 的一级子目录，新布局下那是「原视频」「弹幕版」两个容器目录，
+    # 里面只有子目录、没有 .ts → 恒扫不到孤儿，静默报"干净"。
+    src_root = os.path.join(REPLAY, '原视频')
+    if os.path.isdir(src_root):
+        rooms = [os.path.join(src_root, d) for d in sorted(os.listdir(src_root))
+                 if os.path.isdir(os.path.join(src_root, d))]
+    else:
+        rooms = [os.path.join(REPLAY, d) for d in sorted(os.listdir(REPLAY))
+                 if os.path.isdir(os.path.join(REPLAY, d))
+                 and not d.endswith('（弹幕版）')]
+    for rdir in rooms:
         for fname in sorted(os.listdir(rdir)):
             if not (fname.startswith('[正在录制]') and fname.endswith('.ts')):
                 continue
@@ -129,6 +139,12 @@ def scan():
 def backup():
     stamp = time.strftime('%Y%m%d-%H%M%S')
     dst = os.path.join(UP, 'logs', f'dmr_state.db.bak-{stamp}')
+    try:
+        from _guard import sqlite_backup
+        if sqlite_backup(DB, dst):
+            return dst
+    except Exception:                                            # noqa: BLE001
+        pass
     shutil.copy2(DB, dst)
     return dst
 

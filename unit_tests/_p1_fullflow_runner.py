@@ -180,7 +180,7 @@ def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--config", default="configs/global.yml",
                         help="用户的全局配置（作为基底，不会改动它）")
-    parser.add_argument("--url", default="https://live.bilibili.com/1773507572")
+    parser.add_argument("--url", default="https://live.bilibili.com/10000001")
     parser.add_argument("--segment", type=int, default=300, help="分段时间（秒）")
     parser.add_argument("--engine", default="ffmpeg",
                         choices=["auto", "ffmpeg", "streamgears", "streamlink", "pyrequests"],

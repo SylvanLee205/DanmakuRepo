@@ -120,6 +120,12 @@ print()
 sys.path.insert(0, ROOT)
 os.chdir(ROOT)
 import importlib
+
+try:                                                             # GBK 控制台下 emoji 打印不崩
+    from _guard import ensure_utf8_stdout as _ensure_utf8
+    _ensure_utf8()
+except Exception:                                                # noqa: BLE001
+    pass
 for mod in ('DMR.Cleaner', 'DMR.Render', 'DMR.Uploader',
             'DMR.Task.liveevents', 'DMR.Downloader.stream_downloader',
             'DMR.notify'):

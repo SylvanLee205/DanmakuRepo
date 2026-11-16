@@ -10,7 +10,18 @@ import shutil
 import sys
 import time
 
+try:                                                             # GBK 控制台下 emoji 打印不崩
+    from _guard import ensure_utf8_stdout as _ensure_utf8
+    _ensure_utf8()
+except Exception:                                                # noqa: BLE001
+    pass
+
 _PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))   # 项目根目录，自动识别（可放在任意路径）
+
+try:                                                            # 与主程序共用同一套判据
+    from DMR.paths import DM_MARK, DANMAKU_SUBDIR
+except Exception:                                               # noqa: BLE001
+    DM_MARK, DANMAKU_SUBDIR = '（弹幕版）', '弹幕版'
 
 
 PROD = _PROJECT_ROOT
@@ -108,10 +119,13 @@ for f in os.listdir(mlog) if os.path.isdir(mlog) else []:
         add(fp, 'Mod 仓库 14 天前的日志')
 
 # ── 10. (2) 重复渲染产物：只有同名无 (2) 的版本存在且更完整时才删 ──
+# ⚠️ 弹幕版是成品，永不参与"重复"清理（项目红线）。这里必须**目录级剪枝**，
+#    不能只靠文件名判断：`xxx(2)（弹幕版）.mp4` 是合法重录成品。
 pdir = os.path.join(PROD, '直播回放')
 for r, ds, fs in os.walk(pdir):
+    ds[:] = [d for d in ds if d != DANMAKU_SUBDIR]
     for f in fs:
-        if '(2)' not in f:
+        if '(2)' not in f or DM_MARK in f:
             continue
         fp = os.path.join(r, f)
         base = f.replace('(2)', '', 1)

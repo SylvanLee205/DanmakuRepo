@@ -159,11 +159,19 @@ class FFmpegDownloader():
             while not self.stoped:
                 if self.ffmpeg_proc.stdout is None:
                     break
-                line = self.ffmpeg_proc.stdout.readline().strip()
-                # 空行意味着管道已 EOF（子进程退出）：必须退出循环。
-                # 否则 readline() 会一直立刻返回空串，线程空转吃满一个 CPU 核。
-                if len(line) == 0:
+                raw = self.ffmpeg_proc.stdout.readline()
+                # 2026-11-16 修（审查报告 L-16）：原来是
+                #     line = ...readline().strip()
+                #     if len(line) == 0: break
+                # 于是 ffmpeg 输出的**纯空白行/纯 \r** 也会被当成 EOF，
+                # 监控线程提前退出，15 秒后上层判定"管道故障"，
+                # 无谓地重连并切断一个完全正常的录制分段。
+                # 只有真正的空串（EOF，readline 返回 ''）才代表子进程退出。
+                if raw == '':
                     break
+                line = raw.strip()
+                if not line:
+                    continue
                 self._append_line(line)
 
         if self.ffmpeg_proc.stdout is not None:

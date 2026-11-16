@@ -217,7 +217,7 @@ def parse_room_ids(text: str) -> list:
     found = []
     # 0) 短链先展开
     text = expand_short_links(text)
-    # 1) 标准直播间链接 https://live.douyin.com/865102911165
+    # 1) 标准直播间链接 https://live.douyin.com/123456789012
     for m in re.finditer(r'live\.douyin\.com/(\d{6,})', text):
         if m.group(1) not in found:
             found.append(m.group(1))
@@ -329,8 +329,8 @@ def main():
         # 用户什么都没给（空剪贴板 + 空输入）不算错误，别让 bat 弹错误横幅
         benign = not raw.strip()
         print('没认出直播间地址。支持的格式：')
-        print('  https://live.douyin.com/865102911165')
-        print('  865102911165')
+        print('  https://live.douyin.com/123456789012')
+        print('  123456789012')
         print('  或者一段包含上面任一种的文字（抖音分享文本也行）')
         if benign:
             print()

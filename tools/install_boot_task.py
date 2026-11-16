@@ -41,6 +41,12 @@ if PROJ not in sys.path:
 #    写 'schtasks' / 'powershell' 会 FileNotFoundError（2026-10-19 踩过）。
 from DMR.paths import powershell_exe, system32  # noqa: E402
 
+try:                                                             # GBK 控制台下 emoji 打印不崩
+    from _guard import ensure_utf8_stdout as _ensure_utf8
+    _ensure_utf8()
+except Exception:                                                # noqa: BLE001
+    pass
+
 SCHTASKS = system32('schtasks.exe')
 
 TASK = 'DMR_Boot'

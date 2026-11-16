@@ -85,7 +85,7 @@ class TestSessions(_RepoTestCase):
 
     def test_create_and_read_back(self):
         session = self.make_session(
-            platform="bilibili", room_id="1746", room_url="https://live.bilibili.com/1746",
+            platform="bilibili", room_id="9999", room_url="https://live.bilibili.com/9999",
             streamer_uid="999", group_id="23333",
         )
         loaded = self.repo.get_session("sess-1")
@@ -94,7 +94,7 @@ class TestSessions(_RepoTestCase):
         self.assertEqual(loaded.session_id, session.session_id)
         self.assertEqual(loaded.taskname, "testtask")
         self.assertEqual(loaded.platform, "bilibili")
-        self.assertEqual(loaded.room_id, "1746")
+        self.assertEqual(loaded.room_id, "9999")
         self.assertEqual(loaded.streamer_name, "测试主播")
         self.assertEqual(loaded.streamer_uid, "999")
         self.assertEqual(loaded.title, "测试标题")
