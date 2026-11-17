@@ -10,7 +10,9 @@
 """
 import importlib.util
 import os
+import shutil
 import sys
+import tempfile
 import unittest
 
 MODULE_PATH = os.path.join(
@@ -218,6 +220,54 @@ class TestOwnershipFilter(unittest.TestCase):
         proc = self._proc([r'C:\Python311\python.exe', 'main.py'],
                           exe=r'C:\Python311\python.exe', cwd=r'C:\OtherProject')
         self.assertFalse(self.m._is_our_process(proc, self.proj))
+
+
+class TestSuperviseLock(unittest.TestCase):
+    """复审 R-7：守护模式必须持锁，否则两个守护会各拉一个 DMR。"""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp(prefix='dmr-supervise-')
+        self.addCleanup(shutil.rmtree, self.tmp, True)
+        self.m = load_module(['--boot-fallback', '180', '--dry-run'])
+        self.m.log = lambda *_a, **_k: None
+
+    def _lock(self):
+        return os.path.join(self.tmp, 'supervise.lock')
+
+    def test_second_acquire_is_refused(self):
+        self.assertTrue(self.m.acquire_lock(path=self._lock()))
+        # 模拟"另一个进程"：本进程放弃所有权，但锁文件仍在
+        self.m._LOCK_HELD = None
+        self.assertFalse(self.m.acquire_lock(path=self._lock()),
+                         '锁文件在场且持有者pid存活时必须拒绝')
+
+    def test_release_allows_reacquire(self):
+        self.assertTrue(self.m.acquire_lock(path=self._lock()))
+        self.m.release_lock()
+        self.assertFalse(os.path.exists(self._lock()))
+        self.assertTrue(self.m.acquire_lock(path=self._lock()))
+        self.m.release_lock()
+
+    def test_dead_pid_lock_is_reclaimed_without_waiting_max_age(self):
+        """崩溃留下的锁：pid 不在了就立刻接管，不能干等 30 分钟。"""
+        try:
+            import psutil  # noqa: F401
+        except ImportError:
+            self.skipTest('需要 psutil 判 pid 存活')
+        with open(self._lock(), 'w', encoding='utf-8') as f:
+            f.write('999999 0')          # 几乎不可能存在的 pid
+        self.assertTrue(self.m.acquire_lock(path=self._lock()))
+        self.m.release_lock()
+
+    def test_supervise_returns_immediately_when_lock_held(self):
+        """真身（非 dry-run）发现锁已被活着的守护持有 → 直接退出，不进循环。"""
+        m = load_module(['--boot-fallback', '180'])
+        m.log = lambda *_a, **_k: None
+        lock = self._lock()
+        with open(lock, 'w', encoding='utf-8') as f:
+            f.write(f'{os.getpid()} 0')
+        m.SUPERVISE_LOCK = lock
+        self.assertEqual(m.mode_supervise(), 0)
 
 
 if __name__ == '__main__':

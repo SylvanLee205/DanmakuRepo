@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import os
 import sys
+import tempfile
 import unittest
 from datetime import datetime, timedelta
 from typing import Iterable
@@ -227,6 +228,11 @@ class DMRTestCase(unittest.TestCase):
         # 而本函数用 __new__ 绕过 __init__（避免依赖线程与真实配置）
         events.state_repo = None
         events._sessions_ensured = set()
+        # 「失败请求 → 槽位」映射默认会从 .temp 读盘（复审 L-2 的跨重启持久化）。
+        # 单测必须断开：既不能读生产文件，也不能把测试数据写回生产 .temp。
+        events._retriable_requests = {}
+        events._retry_journal = os.path.join(
+            tempfile.gettempdir(), f'dmr-test-retry-{os.getpid()}.json')
         events.config = {
             "common_event_args": common_event_args or {
                 "auto_render": False, "auto_upload": False,

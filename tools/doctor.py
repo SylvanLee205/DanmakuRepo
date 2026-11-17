@@ -55,6 +55,33 @@ def _mask_config(obj):
     return obj
 
 
+#: 日志尾部的脱敏规则。日志是**运行时输出**，没有 yaml 结构，只能按模式抹：
+#: 房间号会出现在 URL 里、key 会出现在请求异常里、手机号会出现在弹幕调试里。
+_LOG_MASKS = (
+    (re.compile(r'sctp[A-Za-z0-9]{10,}'), '<Server酱key已脱敏>'),
+    # 域名要捕获（\1），房间号是 \2 —— 写反了会把房间号当成域名替换：
+    #   https://live.douyin.com/123456789012 → https://live.123456789012.com/…
+    (re.compile(r'live\.(douyin|bilibili)\.com/(\d{3,})'),
+     r'live.\1.com/<房间号已脱敏>'),
+    (re.compile(r'(?i)\b(cookie|authorization|set-cookie)(\s*[:=]\s*)(\S{8,})'),
+     r'\1\2<已脱敏>'),
+    (re.compile(r'(?<!\d)1[3-9]\d{9}(?!\d)'), '<手机号已脱敏>'),
+)
+
+
+def _mask_log_text(text: str) -> str:
+    """把日志文本里的凭据/房间号抹掉（复审 S-4）。
+
+    为什么必须做：``--export`` 的用途就是"发给别人 / 贴给 AI 看"，而
+    ``logs/`` 里每个分段都会打印完整的直播地址、弹幕里的用户信息，
+    出错时还会把 cookie/key 一起打进异常栈。原实现只脱敏了配置，
+    日志原文照抄进 zip —— "脱敏"只做了一半，比不做更危险（让人以为安全）。
+    """
+    for pat, rep in _LOG_MASKS:
+        text = pat.sub(rep, text)
+    return text
+
+
 def _mask_config_text(text: str) -> str:
     """按行掩码 yaml 文本。
 
@@ -504,7 +531,9 @@ def export_pack():
                 try:
                     with open(lp, encoding='utf-8', errors='replace') as f:
                         tail = f.readlines()[-3000:]
-                    zf.writestr(f'logs/{os.path.basename(lp)}', ''.join(tail))
+                    # 日志同样要过脱敏（复审 S-4）：原实现只脱敏配置，日志原文进包
+                    zf.writestr(f'logs/{os.path.basename(lp)}',
+                                _mask_log_text(''.join(tail)))
                     n += 1
                 except OSError:
                     pass

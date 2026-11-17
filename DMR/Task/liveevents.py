@@ -19,7 +19,15 @@ from ..state import (
     rebuild_video_info,
 )
 from ..utils import *
-from ..paths import DM_MARK, danmaku_dir_for
+from ..paths import DM_MARK, TEMP, danmaku_dir_for
+
+#: 「失败请求 → 槽位」映射的落盘文件。
+#: ⚠️ 2026-11-17 修（复审 L-2 的第二半）：这份映射原来只在内存里，
+#:    进程一重启就没了 —— 而 WebUI 的「重试失败任务」列表是从状态库/日志
+#:    恢复的，重启之后用户照样能点重试，插件也照样用**旧的 request_id** 重投，
+#:    于是 2026-11-16 做的兜底认领等于白写：重试成功、状态仍停在 failed、
+#:    成品不上传、源文件永不清理。落盘后跨重启也能认回来。
+_RETRY_JOURNAL = os.path.join(TEMP, 'retry_requests.json')
 
 #: 内存状态槽位（``state_dict`` 的 ``vtype``）到持久化产物种类的映射。
 #: 槽位名沿用 ``VideoInfo.dtype`` 的历史命名，产物种类则是持久化层的枚举。
@@ -79,6 +87,8 @@ class LiveEvents(BaseEvents):
         #: 状态永远停在 failed，也不会触发后续上传/清理（渲染重试成功但成品
         #: 永不上传，DB 永远 failed）。这里留一份映射供结果回调兜底认领。
         self._retriable_requests: dict = {}
+        #: 映射落盘位置（测试可注入到临时目录，避免写生产 .temp）
+        self._retry_journal = _RETRY_JOURNAL
 
     @property
     def event_dict(self):
@@ -762,15 +772,53 @@ class LiveEvents(BaseEvents):
                 pass
 
     def _retriable_map(self) -> dict:
-        """「失败请求 → 槽位」映射（延迟初始化）。
+        """「失败请求 → 槽位」映射（延迟初始化，**首次从磁盘恢复**）。
 
         不直接在 ``__init__`` 里硬用：单元测试与极少数代码路径会用
         ``__new__`` 造对象（不跑 ``__init__``），这里兜一层避免 AttributeError。
+        同理 ``_retry_journal`` 也走 getattr 兜底。
+
+        返回值改动后**必须**调 ``_save_retriable()``（内部不做自动持久化，
+        因为调用点多是"取出来 pop 一条"，逐次写盘更清楚）。
         """
         m = getattr(self, '_retriable_requests', None)
         if m is None:
-            m = self._retriable_requests = {}
+            m = self._retriable_requests = self._load_retriable()
         return m
+
+    def _load_retriable(self) -> dict:
+        """从磁盘读回失败请求映射；文件缺失/损坏都按"空"处理。"""
+        path = getattr(self, '_retry_journal', _RETRY_JOURNAL)
+        try:
+            with open(path, encoding='utf-8') as f:
+                raw = json.load(f)
+        except FileNotFoundError:
+            return {}
+        except Exception as e:                                   # noqa: BLE001
+            self.logger.debug(f'读取重试映射 {path} 失败，按空处理：{e}')
+            return {}
+        out = {}
+        if isinstance(raw, dict):
+            for k, v in raw.items():
+                if isinstance(v, (list, tuple)) and len(v) == 3:
+                    out[str(k)] = (v[0], v[1], v[2])
+        return out
+
+    def _save_retriable(self) -> None:
+        """把映射原子写回磁盘（tmp + replace，避免断电留半截 JSON）。"""
+        path = getattr(self, '_retry_journal', _RETRY_JOURNAL)
+        data = {str(k): list(v) for k, v in self._retriable_map().items()}
+        try:
+            d = os.path.dirname(path)
+            if d:
+                os.makedirs(d, exist_ok=True)
+            tmp = f'{path}.tmp'
+            with open(tmp, 'w', encoding='utf-8') as f:
+                json.dump(data, f, ensure_ascii=False)
+            os.replace(tmp, path)
+        except Exception as e:                                   # noqa: BLE001
+            # 落盘失败不影响内存兜底（同一次运行内重试仍能认领）
+            self.logger.debug(f'写重试映射 {path} 失败：{e}')
 
     def _handle_unusable(self, artifact, item) -> None:
         """处置"大小不足以继续处理"的产物（文件太小，或文件已不存在）。
@@ -1388,6 +1436,7 @@ class LiveEvents(BaseEvents):
         if not matched and request_id is not None:
             adopted = self._retriable_map().pop(request_id, None)
             if adopted is not None:
+                self._save_retriable()
                 _gid, _vtype, _idx = adopted
                 _states = self.state_dict.get(_gid) or []
                 if 0 <= _idx < len(_states) and _vtype in _states[_idx]:
@@ -1574,6 +1623,7 @@ class LiveEvents(BaseEvents):
         if not matched and request_id is not None:
             adopted = self._retriable_map().pop(request_id, None)
             if adopted is not None:
+                self._save_retriable()
                 _gid, _vtype, _idx = adopted
                 _states = self.state_dict.get(_gid) or []
                 if 0 <= _idx < len(_states) and _vtype in _states[_idx]:
@@ -1767,6 +1817,7 @@ class LiveEvents(BaseEvents):
                                 if len(_retriable) > 500:
                                     for _k in list(_retriable)[:100]:
                                         _retriable.pop(_k, None)
+                                self._save_retriable()
                             self.logger.warning(
                                 f'{self.name}: {vtype} 标记为 failed（任务失败，不再等待），'
                                 f'文件: {getattr(info.get("file"), "path", "?")}'

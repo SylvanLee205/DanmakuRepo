@@ -59,6 +59,9 @@ STOP = os.path.join(UP, 'tools', 'stop_dmr.py')
 PY = os.path.join(UP, '.venv', 'Scripts', 'python.exe')
 LOG = os.path.join(UP, 'logs', 'autostart.log')
 LOCK = os.path.join(UP, 'logs', 'autostart.lock')
+#: 守护模式自己的锁（复审 R-7）。**不能复用 autostart.lock** —— 登录自启要
+#: 拿那把锁做 stop/start，守护进程若长期持有，"窗口跟着人走"就再也动不了。
+SUPERVISE_LOCK = os.path.join(UP, 'logs', 'supervise.lock')
 
 RETRIES = 3                 # 启动重试次数
 WAIT_AFTER_LAUNCH = 25      # 每次启动后等多少秒查进程
@@ -340,10 +343,10 @@ def logon_action(procs, mine: int) -> str:
 # ---------------------------------------------------------------------------
 # 互斥锁：登录瞬间可能有多个自启入口同时触发
 # ---------------------------------------------------------------------------
-_LOCK_HELD = False
+_LOCK_HELD = None       # 当前持有的锁文件路径；None = 没持锁
 
 
-def _start_heartbeat() -> None:
+def _start_heartbeat(path: str) -> None:
     """持锁期间定时刷新锁文件 mtime。
 
     没有心跳时，"持锁多久"就等于"锁文件多久没被写"，而 migrate 分支在
@@ -358,7 +361,7 @@ def _start_heartbeat() -> None:
         def _beat():
             while not _heartbeat_stop.wait(LOCK_HEARTBEAT):
                 try:
-                    os.utime(LOCK, None)
+                    os.utime(path, None)
                 except OSError:
                     return
 
@@ -380,33 +383,66 @@ def _stop_heartbeat() -> None:
     _heartbeat_stop = None
 
 
-def acquire_lock(max_age: float = LOCK_MAX_AGE) -> bool:
-    """拿到返回 True；别人正在跑（锁很新）返回 False。
+def _lock_is_stale(path: str, max_age: float) -> bool:
+    """锁文件是否该被清掉。
 
-    锁异常陈旧说明上一个运行者崩了，清理后重试一次。文件系统出问题时
-    不互相挡（宁可偶尔双开，也有 main.py 的进程互斥兜底）。
+    两层判据：
+      · 文件年龄超过 ``max_age``（老逻辑，兜底）；
+      · 文件里记的 pid 已经不在了 —— **崩溃后不必等满 30 分钟**。
+
+    ⚠️ 只用 psutil 判 pid，**不用 os.kill(pid, 0)**：Windows 上
+    ``os.kill`` 对非 CTRL_* 信号走的是 ``TerminateProcess``，探活会变成杀人。
+    psutil 不可用时退回纯年龄判断（保守，宁可不抢）。
+    """
+    try:
+        age = time.time() - os.path.getmtime(path)
+    except OSError:
+        return False
+    if age > max_age:
+        return True
+    try:
+        with open(path, encoding='utf-8', errors='replace') as f:
+            pid = int((f.read().split() or ['0'])[0])
+    except (OSError, ValueError, IndexError):
+        return False
+    if pid <= 0:
+        return False
+    try:
+        import psutil
+    except ImportError:
+        return False
+    try:
+        return not psutil.pid_exists(pid)
+    except Exception:                                            # noqa: BLE001
+        return False
+
+
+def acquire_lock(max_age: float = LOCK_MAX_AGE, path: str = '') -> bool:
+    """拿到返回 True；别人正在跑返回 False。
+
+    锁异常陈旧（年龄超限或持有者已死）说明上一个运行者崩了，清理后重试一次。
+    文件系统出问题时不互相挡（宁可偶尔双开，也有 main.py 的进程互斥兜底）。
     """
     global _LOCK_HELD
+    if _LOCK_HELD:
+        return True
+    path = path or LOCK
     for _ in range(2):
         try:
-            fd = os.open(LOCK, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+            fd = os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
             try:
                 os.write(fd, f'{os.getpid()} {time.time():.0f}'.encode())
             finally:
                 os.close(fd)
-            _LOCK_HELD = True
-            _start_heartbeat()
+            _LOCK_HELD = path
+            _start_heartbeat(path)
             return True
         except FileExistsError:
-            try:
-                age = time.time() - os.path.getmtime(LOCK)
-            except OSError:
-                return True
-            if age <= max_age:
+            if not _lock_is_stale(path, max_age):
                 return False
-            log(f'发现陈旧的自启锁（{int(age)} 秒前创建），清理后重试。')
+            log(f'发现陈旧的锁（{os.path.basename(path)}），清理后重试。')
             try:
-                os.remove(LOCK)
+                os.remove(path)
             except OSError:
                 pass
         except OSError:
@@ -416,14 +452,15 @@ def acquire_lock(max_age: float = LOCK_MAX_AGE) -> bool:
 
 def release_lock() -> None:
     global _LOCK_HELD
-    if not _LOCK_HELD:
+    path = _LOCK_HELD
+    if not path:
         return
     _stop_heartbeat()
     try:
-        os.remove(LOCK)
+        os.remove(path)
     except OSError:
         pass
-    _LOCK_HELD = False
+    _LOCK_HELD = None
 
 
 # ---------------------------------------------------------------------------
@@ -567,8 +604,14 @@ def run_foreground() -> None:
         log('[DRY-RUN] 将前台运行 Start_Render.bat（阻塞）')
         return
     log('前台运行 Start_Render.bat（本任务在此阻塞，任务状态 = DMR 状态）')
+    # ⚠️ 2026-11-17 修（复审 R-3）：``DMR_NONINTERACTIVE`` 一直被 check_env 读、
+    #    却从来没有地方设置 —— 等于那道"非交互就别等回车"的护栏从没生效过。
+    #    这里（session 0 兜底启动，确定没有人能按键）显式置位；登录自启那条路
+    #    仍然是可见控制台，人可能就在面前，保留交互提示更有用。
+    env = os.environ.copy()
+    env['DMR_NONINTERACTIVE'] = '1'
     try:
-        rc = subprocess.call(['cmd.exe', '/c', BAT], cwd=UP)
+        rc = subprocess.call(['cmd.exe', '/c', BAT], cwd=UP, env=env)
         log(f'Start_Render.bat 已退出，returncode={rc}；继续守护。')
     except Exception as e:
         log(f'前台运行失败（{type(e).__name__}: {e}），30 秒后重试。')
@@ -576,7 +619,36 @@ def run_foreground() -> None:
 
 
 def mode_supervise() -> int:
-    """常驻守护：保证任何情况下都有一个 DMR 实例在录。"""
+    """常驻守护的入口：**先抢锁**，再进循环。
+
+    ⚠️ 2026-11-17 修（复审 R-7）：守护模式有"拉起 DMR"的副作用，却从来不拿锁。
+    计划任务被重复创建、或有人再双击一次 Run_DMR.bat，就会有两个守护同时判定
+    "DMR 没在跑"，各自拉起一个实例 —— 后起的撞 main.py 的 Global 互斥体退 3，
+    日志里一片"启动失败"，还可能和真身抢 PID 文件。两个守护互相看对方拉起的
+    实例、判断"已经在跑"而各自 sleep，看起来正常，实际失去兜底能力。
+
+    锁用独立的 ``supervise.lock``：复用 autostart.lock 会让长期持有者挡住
+    登录自启的 stop/start（那正是"窗口跟着人走"的机制）。
+
+    ``--dry-run`` 不加锁（模块文档里就是这个约定），测试与人工排查可以随时跑。
+    """
+    if DRY_RUN:
+        return _supervise_loop()
+    if not acquire_lock(path=SUPERVISE_LOCK):
+        log('已有另一个守护进程在跑（supervise.lock 未过期），本次直接退出，'
+            '不重复拉起 DMR。')
+        return 0
+    log(f'守护锁已获取：{SUPERVISE_LOCK}')
+    try:
+        return _supervise_loop()
+    except KeyboardInterrupt:
+        raise
+    finally:
+        release_lock()
+
+
+def _supervise_loop() -> int:
+    """守护循环主体（由 :func:`mode_supervise` 持锁后调用）。"""
     started = time.time()
     dead_since = None
     last_backstop = 0.0

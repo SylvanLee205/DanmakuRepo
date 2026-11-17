@@ -65,7 +65,21 @@ class WebApi:
                 'Web 服务仍在使用默认口令（%s），已强制只绑定 127.0.0.1。'
                 '如需局域网访问，请先在配置里设置一个强口令。', username)
             host = '127.0.0.1'
-        
+
+        # ── 无登录模式同样要收窄 ───────────────────────────────────
+        # ⚠️ 2026-11-17 修（复审 S-1）：``force_login=False`` 时 ``login_required``
+        # 直接放行，配合 ``host=0.0.0.0`` 就是"局域网内任何人可以停止录制、删任务、
+        # 改配置、翻看所有历史"。单机使用确实可能想要免登录，但"免登录 + 对外监听"
+        # 必须是配置里的**显式选择**，不能靠默认值凑出来。
+        _local = ('127.0.0.1', 'localhost', '::1')
+        _allow_remote = bool(kwargs.get('allow_insecure_remote') or False)
+        if not force_login and not _allow_remote and str(host) not in _local:
+            logging.getLogger(__name__).warning(
+                'Web 服务已关闭登录校验（force_login=false）却监听 %s，'
+                '已强制只绑定 127.0.0.1。确实需要局域网免登录访问，请在配置里'
+                '显式设置 web_service_args.allow_insecure_remote: true。', host)
+            host = '127.0.0.1'
+
         # WebAPI Config
         self.host = host
         self.port = port

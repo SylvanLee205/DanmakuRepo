@@ -687,5 +687,58 @@ class TestSettleExistingProduct(_SyncTestCase):
                              "ffprobe 明确读不了才判坏")
 
 
+class TestRetryJournal(_SyncTestCase):
+    """复审 L-2（后半）：失败请求映射必须跨重启存活。
+
+    背景：WebUI 的「重试失败任务」列表来自状态库/日志，进程重启后依然显示；
+    插件重试时用的是**原来的 request_id**。映射只放内存的话，重启后用户点重试
+    —— 状态停在 failed、成品不上传、源文件永不清理，而日志里看起来"重试成功"。
+    """
+
+    def setUp(self) -> None:
+        super().setUp()
+        self.journal = self.path('retry_requests.json')
+
+    def _events(self):
+        ev = self.make_events()
+        ev._retry_journal = self.journal
+        # 基座为避免污染生产 .temp 预置了空 dict；这里删掉，模拟"刚启动未恢复"
+        try:
+            del ev._retriable_requests
+        except AttributeError:
+            pass
+        return ev
+
+    def test_map_survives_restart(self):
+        ev = self._events()
+        ev._retriable_map()['rid-1'] = ('g1', 'dm_video', 2)
+        ev._save_retriable()
+
+        restarted = self._events()          # 新对象 = 新进程
+        self.assertEqual(restarted._retriable_map().get('rid-1'),
+                         ('g1', 'dm_video', 2))
+
+    def test_popped_entry_is_removed_from_disk(self):
+        ev = self._events()
+        ev._retriable_map()['rid-2'] = ('g2', 'src_video', 0)
+        ev._save_retriable()
+        ev._retriable_map().pop('rid-2')
+        ev._save_retriable()
+
+        self.assertNotIn('rid-2', self._events()._retriable_map())
+
+    def test_corrupt_journal_is_ignored(self):
+        with open(self.journal, 'w', encoding='utf-8') as f:
+            f.write('{ 这不是 json')
+        self.assertEqual(self._events()._retriable_map(), {})
+
+    def test_values_are_tuples_not_lists(self):
+        """JSON 读回来是 list；调用方按 3 元组解包，类型要统一。"""
+        ev = self._events()
+        ev._retriable_map()['rid-3'] = ('g3', 'dm_video', 1)
+        ev._save_retriable()
+        self.assertIsInstance(self._events()._retriable_map()['rid-3'], tuple)
+
+
 if __name__ == "__main__":
     unittest.main()
