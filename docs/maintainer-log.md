@@ -1610,3 +1610,61 @@ src_video 仍可恢复 → 下轮对账自动重派。
   扫描命中 **0**，替换标记确认生效
 - `_retriable_requests` 落盘路径在单测里被基座指向临时目录（`unit_tests/support.py`），
   不读也不写生产 `.temp`
+
+---
+
+# 2026-11-18 · 运行观测：emoji 目录名让整条上传链永久卡死
+
+## 一、这一轮到底发生了什么
+
+进程自 11-16 21:17 起连续跑了 42.6 小时（未重启，所以 11-17 那批修复都还没进进程）。
+日志 `DMR-20261116(10).log` 共 16096 行：**4 error / 60 warning**，82 个分段录制完成，
+46 次上传、38 次成功，4 次真失败（3 次同一个根因，1 次源文件损坏）。
+
+## 二、根因：只清洗了文件名，没清洗目录名
+
+`🐈小鱼` 的三段弹幕版（375 MB）连续失败，rclone 报：
+
+```
+Failed to copy: Update mkParentDir failed: 500 Internal Server Error
+Failed to copy: Update mkParentDir failed: 403 Forbidden
+```
+
+`subprocess_uploader` 有个"百度网盘拒绝 emoji"的兜底（2026-10-05 加的），但它只把
+**文件名**改成 `小鱼-…mp4`，目标目录仍是 `🐈小鱼` —— 而百度 API 连**创建**含 emoji
+的目录都拒绝。于是每次上传都死在 mkdir，重试 3 轮后标 `failed`（终态），
+成品永久滞留本地：不补传、不被 24h 清理、界面显示"失败"。
+
+现场复现（只读探测，已清理）：
+
+```
+rclone mkdir "cd2:百度网盘/DMR录播/.emoji-test-🐈"
+→ Attempt 1/3 failed: 500 Internal Server Error  ×3
+```
+
+修法：`_sanitize_remote_path()` 清洗目标路径的**每一段**（保留 `cd2:` 前缀），
+`copy/move` 与 `copyto/moveto` 两条路径都覆盖；只清洗目录时保留原 `copy` 子命令，
+不无谓改写成 `copyto`。
+
+## 三、处置
+
+- 代码修复 + 新增 `unit_tests/test_uploader_emoji.py`（13 条，含"只目录带 emoji"
+  和"文件+目录都带"两种组合）。全量 **633 tests OK**。
+- 3 条 `failed` 产物的状态改回 `rendered`（`bac6d5ce:dm_video:1..3`）——
+  源与成品都在，只差一次上传。**下次重启**加载新代码后，恢复流程会重新派发并把它们
+  传到 `小鱼` 目录。
+- 本地目录名 `🐈小鱼` 不改（继续按主播名归档）；只有远程路径被净化。
+
+## 四、另一处失败：源文件本身是坏的
+
+`小奈儿 / Nyssa-2026年11月18日14点41分.ts`（92 MB，231 秒）渲染失败，ffmpeg 退出码 69，
+报 `error while decoding MB … corrupt decoded frame`。QSV 两次 + libx265 兜底全部失败。
+
+验证方式：**不经过 DMR** 直接 `ffmpeg -v error -i <ts> -f null -`，同样退出 69 ——
+是录制期间丢包/写入残缺导致的源损坏（该主播当晚有 3 次"下载速度过慢"告警），
+不是渲染代码的问题。这条没有代码可修：成品做不出来，源文件可删可留。
+
+## 五、结论
+
+- 属于"代码 bug"的只有 emoji 目录这一条，已修；其余是网络抖动与源损坏。
+- 46 次上传里 38 次成功，其余 8 次重试后成功 —— 上传链路本身是健康的。

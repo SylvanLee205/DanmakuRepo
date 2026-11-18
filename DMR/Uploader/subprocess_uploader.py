@@ -75,11 +75,45 @@ class SubprocessUploader:
     # 结果**本地和云端同时没有**（比 copy 漏清洗更严重）。2026-10-05 审查发现。
     _TO_SINGLE_TARGET = {'copy': 'copyto', 'move': 'moveto'}
 
-    def _sanitize_rclone_copy(self, cmds: list, file) -> list:
-        """把 `rclone copy|move <src> <dst目录>` 改写成
-        `rclone copyto|moveto <src> <dst目录>/<干净文件名>`。
+    @staticmethod
+    def _sanitize_remote_path(dst: str):
+        """把远程路径的**每一段**都清洗干净，返回 (新路径, [(旧段, 新段), ...])。
 
-        只在「命令是 rclone copy/move、且目标文件名含 emoji」时才动，其它情况原样返回。
+        ⚠️ 2026-11-18：原实现只清洗文件名，**没管目录名**。生产实测
+        ``🐈小鱼`` 三段的弹幕版全部上传失败，rclone 报
+        ``Update mkParentDir failed: 500 Internal Server Error`` ——
+        百度网盘 API 连"创建含 emoji 的目录"都拒绝。文件名改干净了，
+        父目录还是 ``🐈小鱼``，于是每次都死在 mkdir 上，重试 3 轮后放弃，
+        成品永久滞留本地（既不补传也不被 24h 清理）。
+
+        ``cd2:`` 这种 remote 前缀必须原样保留，只清洗冒号后面的路径段。
+        """
+        remote, sep, path = dst.partition(':')
+        if not sep:
+            remote, path = '', dst
+        changed = []
+        out = []
+        for part in path.split('/'):
+            if part and has_bad_remote_chars(part):
+                safe = safe_remote_name(part)
+                if safe != part:
+                    changed.append((part, safe))
+                out.append(safe)
+            else:
+                out.append(part)
+        new_path = '/'.join(out)
+        return (f'{remote}:{new_path}' if sep else new_path), changed
+
+    def _sanitize_rclone_copy(self, cmds: list, file) -> list:
+        """把 rclone 命令的远程目标路径清洗干净。
+
+        三种情形：
+          · ``copy|move <src> <dst目录>``，文件名含 emoji → 改写成
+            ``copyto|moveto <src> <干净目录>/<干净文件名>``；
+          · 只有目录段含 emoji → 保留子命令，只替换目标路径；
+          · ``copyto|moveto <src> <完整路径>`` → 清洗整个目标路径。
+
+        其它情况原样返回。
         """
         try:
             if len(cmds) < 4:
@@ -87,16 +121,28 @@ class SubprocessUploader:
             if not os.path.basename(str(cmds[0])).lower().startswith('rclone'):
                 return cmds
             sub = str(cmds[1])
+            src, dst = str(cmds[2]), str(cmds[3])
+            new_dst, dir_changes = self._sanitize_remote_path(dst)
+            if dir_changes:
+                pairs = '; '.join(f'{a} -> {b}' for a, b in dir_changes)
+                self.logger.warning(
+                    f'远程目录名含 emoji（百度网盘 API 拒绝创建这类目录，'
+                    f'mkParentDir 会 500），已自动改名: {pairs}')
+
             if sub not in self._TO_SINGLE_TARGET:
+                # copyto / moveto：目标就是完整路径，清洗完直接替换
+                if sub in ('copyto', 'moveto') and dir_changes:
+                    return [cmds[0], sub, src, new_dst] + list(cmds[4:])
                 return cmds
 
-            src, dst = str(cmds[2]), str(cmds[3])
             remote_name = os.path.basename(src.replace('\\', '/'))
             if not has_bad_remote_chars(remote_name):
+                if dir_changes:
+                    return [cmds[0], sub, src, new_dst] + list(cmds[4:])
                 return cmds
 
             safe = safe_remote_name(remote_name)
-            target = dst.rstrip('/') + '/' + safe
+            target = new_dst.rstrip('/') + '/' + safe
             single = self._TO_SINGLE_TARGET[sub]
             self.logger.warning(
                 f'远程文件名含 emoji（百度网盘 API 会拒绝），已自动改名为: '
