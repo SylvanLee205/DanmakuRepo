@@ -7,7 +7,7 @@ rem Push BOTH repositories in one go:
 rem   1) public  DanmakuRepo       branch main  (scrubbed, no configs/)
 rem   2) private DanmakuRepo-Full  branch main       (full copy, runnable as-is)
 rem
-rem It refuses to run when master has uncommitted changes.
+rem It refuses to run when local main has uncommitted changes.
 chcp 65001 <nul >nul
 cd /d "%~dp0"
 title Push both repos

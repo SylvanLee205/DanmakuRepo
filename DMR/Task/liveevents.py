@@ -1252,7 +1252,15 @@ class LiveEvents(BaseEvents):
                                                             arg.get('min_length', 0) or 0,
                                                             arg):
                                 continue
-                            upload_group_id = info['file'].upload_group_id if hasattr(info['file'], 'upload_group_id') else group_id
+                            # ⚠️ 2026-11-19 重启实测踩到：`_product_video_info()`
+                            #   造出来的成品 VideoInfo 显式带 `upload_group_id=None`
+                            #   （注释写的是"由上传流程按 group_key 重新挂"），
+                            #   而这里原来用 hasattr 判断 —— 属性存在、值是 None，
+                            #   于是 `None + '_'` 直接 TypeError，恢复流程整批中断
+                            #   （日志：恢复任务 🐈小鱼 的产物失败：unsupported
+                            #   operand type(s) for +: 'NoneType' and 'str'）。
+                            #   必须按"值是否为空"回退到会话的 group_id。
+                            upload_group_id = getattr(info['file'], 'upload_group_id', None) or group_id
                             group_key = upload_group_id+'_'+upload_file_types+'_'+str(upid)
                             upload_msg = PipeMessage(
                                 source=self.name,
@@ -1316,7 +1324,9 @@ class LiveEvents(BaseEvents):
                                 # （原实现直接取 up_videos[0]，会抛 IndexError
                                 # 并中断事件处理）
                                 continue
-                            upload_group_id = up_videos[0].upload_group_id if hasattr(up_videos[0], 'upload_group_id') else group_id
+                            # 同上：upload_group_id 可能是 None（成品 VideoInfo），
+                            # 按值回退，别用 hasattr 判断。
+                            upload_group_id = getattr(up_videos[0], 'upload_group_id', None) or group_id
                             group_key = upload_group_id+'_'+upload_file_types+'_'+str(upid)
                             upload_msg = PipeMessage(
                                 source=self.name,

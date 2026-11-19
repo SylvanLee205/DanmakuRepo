@@ -477,7 +477,7 @@ python -B -m unittest discover -s unit_tests -t .
 2. 看 [`docs/TODO.md`](docs/TODO.md) 的未完成项，别重复劳动。
 3. 改完**跑测试**，然后**重启验证** —— 只跑测试不算完，热加载不覆盖代码。
 
-**改完记得同步两条线**：本地 `master`（完整历史）→ 公开分支（脱敏）→ 私有仓库（完全体）。
+**改完记得同步两条线**：本地 `main`（开发主干，完整历史）→ 公开分支（脱敏）→ 私有仓库（完全体）。
 一条命令搞定：
 
 ```bash
@@ -487,10 +487,18 @@ python tools/push_all.py --apply    # 同步 + 提交 + 推送两个仓库
 
 | 仓库 | 内容 | 说明 |
 |---|---|---|
-| 公开 `DanmakuRepo` → `main` | `master` 的树 + 10 个发布脚手架（示例配置、脱敏工具） | **脱敏**：无 configs/、无状态库、无内网地址 |
-| 私有 `DanmakuRepo-Full` → `main` | `master` 全部内容 **+ `configs/` + `.temp/` + 状态库** | **完全体**，克隆下来放到 `F:\DanmakuRepo` 就能直接跑 |
+| 公开 `DanmakuRepo` → `main` | 本地 `public` 分支的树 = `main` 的树 + 10 个发布脚手架（示例配置、脱敏工具） | **脱敏**：无 configs/、无状态库、无内网地址 |
+| 私有 `DanmakuRepo-Full` → `main` | `main` 全部内容 **+ `configs/` + `.temp/` + 状态库** | **完全体**，克隆下来放到 `F:\DanmakuRepo` 就能直接跑 |
 
-工具会拒绝在 `master` 有未提交改动时推送（宁可让你先整理，也不推半截内容）。
+三个分支各司其职（2026-11-19 统一命名，远端两个仓库都只有 `main`）：
+
+| 分支 | 位置 | 作用 |
+|---|---|---|
+| `main` | 生产目录 `F:\DanmakuRepo` | 开发主干，同步的唯一来源 |
+| `public` | `-prodsync` worktree | 公开树，推送为 `origin/main` |
+| `full-backup` | `-full` worktree | 私有完整副本，推送为 `full/main` |
+
+工具会拒绝在 `main` 有未提交改动时推送（宁可让你先整理，也不推半截内容）。
 两个 worktree（`-prodsync` / `-full`）由 `git worktree` 维护 ——
 **不要在生产目录里切分支**，DMR 正跑着。
 

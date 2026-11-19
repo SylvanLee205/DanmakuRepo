@@ -641,6 +641,42 @@ class TestSettleExistingProduct(_SyncTestCase):
         # 真正的回归断言：走一遍上传检查，不许抛异常（闸门会因缺 moov 拒传）
         events._check_for_upload("g1")
 
+    def test_upload_group_key_falls_back_when_product_has_no_group(self):
+        """★2026-11-19 重启实测：成品 VideoInfo 的 ``upload_group_id`` 是 None。
+
+        ``_product_video_info()`` 显式写 ``info.upload_group_id = None``
+        （注释："由上传流程按 group_key 重新挂"），而 ``_check_for_upload``
+        原来用 ``hasattr`` 判断 —— 属性存在、值是 None，于是
+        ``None + '_'`` 抛 ``TypeError``，被恢复循环吞掉，**整批补传中止**。
+        实测日志：``恢复任务 🐈小鱼 的产物失败：unsupported operand type(s)
+        for +: 'NoneType' and 'str'``，14 个失败上传一个都没重新派出去。
+
+        上面那条用例只是"不抛异常"，因为闸门先拒了（缺 moov），根本走不到
+        这里；所以这里把闸门打桩放行，专门盯 group_key 的拼接。
+        """
+        from unittest import mock
+
+        src = self.path("主播-2026年11月15日22点18分.ts")
+        open(src, "wb").close()
+        product = self.path("主播-2026年11月15日22点18分（弹幕版）.mp4")
+        with open(product, "wb") as f:
+            f.write(b"\0" * 2048)
+        events = self._events_upload(journal=[])
+        video = self.make_video(src, segment_id=1, group_id="g1")
+        events.state_dict["g1"] = self._blank_group(video)
+        events._settle_existing_product("g1", "dm_video", 0, product,
+                                        source_video=video)
+        self.assertIsNone(getattr(events.state_dict["g1"][0]["dm_video"]["file"],
+                                  "upload_group_id", None),
+                          "前提：成品 VideoInfo 的 upload_group_id 应为 None")
+
+        with mock.patch.object(events, "_passes_length_gate", return_value=True):
+            messages = events._check_for_upload("g1")
+
+        self.assertEqual(len(messages), 1, "必须真的派出一个上传任务")
+        self.assertEqual(messages[0].data["upload_group"], "g1_dm_video_0",
+                         "没有 upload_group_id 时应回退到会话 group_id")
+
     def test_skipped_artifact_is_not_faked_as_uploaded(self):
         """★N-7：库里是 SKIPPED（按规则跳过、从未上传）时不得标 uploaded。
 

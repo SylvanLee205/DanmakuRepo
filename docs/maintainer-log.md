@@ -1668,3 +1668,123 @@ rclone mkdir "cd2:百度网盘/DMR录播/.emoji-test-🐈"
 
 - 属于"代码 bug"的只有 emoji 目录这一条，已修；其余是网络抖动与源损坏。
 - 46 次上传里 38 次成功，其余 8 次重试后成功 —— 上传链路本身是健康的。
+
+# 2026-11-19 · 重启验证：补传成功，但恢复流程又踩了两个坑
+
+## 一、重启时机
+
+14:59 之后没有在录的任务（`[正在录制]` 0 个、无 ffmpeg/rclone、最近一场 09:35 结束），
+用 `tools/restart_dmr.py` 正常重启，无孤儿分段。
+
+## 二、坑 1：`upload_group_id` 是 None，整批补传被一个 TypeError 打断
+
+第一次重启后，对账把 18 个"已渲染但未上传"的产物重新送回上传流程，日志却只有：
+
+```
+恢复任务 🐈小鱼 的产物失败：unsupported operand type(s) for +: 'NoneType' and 'str'
+恢复任务 鱼子🔅 的产物失败：同上
+恢复任务 小奈儿 的产物失败：同上
+恢复处理：18 个未完成产物，已重新派发 0 个任务。
+```
+
+根因：`_product_video_info()` 造出来的成品 `VideoInfo` **显式**带
+`upload_group_id = None`（注释写的"由上传流程按 group_key 重新挂"），而
+`_check_for_upload` 用 `hasattr` 判断 —— 属性存在、值是 None，于是
+`None + '_'` 抛 TypeError。异常被启动恢复循环"warning + continue"吞掉，
+**该任务整轮中止**，同一场的其它分段也一起没派出去。
+
+修法：两处都改成按**值**回退 `getattr(..., None) or group_id`。
+新增 `test_upload_group_key_falls_back_when_product_has_no_group` ——
+原来的 `test_settled_slot_is_videoinfo_not_str` 因为上传闸门先拒了（缺 moov），
+根本走不到这一行，所以一直没暴露。已验证：移除修复后该用例报同一个 TypeError。
+
+## 三、坑 2：14 条失败上传记录永远清不掉
+
+第二次重启（带修复）后 14 个任务全部派发、**全部上传成功**，云端逐个核对到文件：
+
+```
+小鱼  10 个（11-17 ×3 + 11-18 ×7）  鱼子 3 个  小奈儿 1 个
+```
+
+但 `.temp/failed_uploads.json` 里那 14 条老记录还在 —— 启动日志永远打印
+「Loaded 14 failed upload tasks」，WebUI 里也一直挂着"待重试"，点一下就会把
+已经在云端的 2GB+ 重传一遍。和当初「Loaded 5 failed render tasks」是同一种假队列。
+
+**踩过的弯路**：第一版在启动时按"状态库 UPLOADED"清理，一条都清不掉。
+原因是状态库只保留**未完结**的场次 —— 一场直播的产物全部进终态后，
+下次启动对账的 D4 会把整场删掉（日志里的"清理场次 N 个"），证据随之消失。
+15:17 那次还能看到 `bac6d5ce` 的记录，15:25 就没了。
+
+最终修法：在**上传成功那一刻**按文件路径对账（`_forget_failed_for_files`），
+同一文件的旧失败记录立即作废。这才是不依赖历史数据的可靠时机。
+新增 `unit_tests/test_uploader_failed_list.py`（7 条，含路径归一化与多文件保守判定）。
+
+存量数据用一次性脚本 `.temp/prune_failed_once.py` 处理：停 DMR → 逐条到云端核对
+文件名+大小 → 只删核对通过的（13 条），剩 1 条保留：
+
+```
+小鱼-2026年11月18日19点11分（弹幕版）.mp4  —  源 .ts 只有 7.6MB，
+成品 2MB，是被 30MB 阈值判掉的尾巴碎片，没上传是正确的。
+```
+
+## 四、当前状态
+
+- 全量 **641 tests OK**；运行中进程加载的已是修复后的代码。
+- 重启后启动日志：`Loaded 0 failed render tasks` / `Loaded 1 failed upload tasks`，
+  对账 0 异常、0 待恢复、0 清理场次。
+
+# 2026-11-19 · 分支命名统一：master → main，原 main → public
+
+## 一、为什么要动
+
+远端两个仓库各挂着三个分支（`main` / `master` / `v5`），而 `main` 与 `master`
+是**两条完全独立的历史**（`git merge-base` 为空）：`main` 从 2021-12-02 的
+`Initial commit` 起，`master` 从 2026-10-18 的「生产环境基线快照」起。
+同一批改动在两边 hash 不同，看起来像分叉，其实是两次 init。
+
+这种"两条历史"本身不是问题（一条对外发布、一条本地开发），问题是命名：
+本地开发主干叫 `master` 而远端叫 `main`，人脑里对不上。
+
+## 二、改成了什么
+
+| 分支 | 位置 | 推送目标 |
+|---|---|---|
+| `main` | 生产目录 `F:/DanmakuRepo`（DMR 运行中） | 同步的唯一来源 |
+| `public` | `-prodsync` worktree | `origin/main` |
+| `full-backup` | `-full` worktree | `full/main` |
+
+远端 `origin` 只留 `main`；远端 `full` 只留 `main`。
+
+**关键点：脱敏必须中转，所以"本地主干"和"远端主干"永远不可能同名同内容。**
+`push_all.py` 需要两棵树：公开树 = 主干 + 10 个发布脚手架文件（示例配置、脱敏工具），
+完整树 = 主干 + `configs/` + `.temp/` + 状态库。改成只有一个 `main` 是做不到的，
+能做到的是把名字理顺 —— 主干叫 `main`，公开树叫 `public`，推送时 `public:main`。
+
+## 三、⚠️ 最容易被踩的一处语义反转
+
+改名之前：`main` = **发布分支**（含 `configs/global.example.yml`），
+`HANDOVER.md` 里专门写过「发行版 tag 打在 `main`，不是 `master`」。
+
+改名之后：`main` = **开发主干**（不含任何示例配置），发布树变成了 `public`。
+**所以现在打 tag 必须打在 `public` 上**，打在 `main` 上打出来的源码包又缺示例配置，
+就是 v6.0.0 那个已经作废的错。`HANDOVER.md` 对应段落已同步改写。
+
+## 四、执行细节
+
+1. 先打回退锚点：`backup/pre-unify-20261119-{master,main,v5,fullmain}`（本地 tag）
+2. `-prodsync` 里 `git branch -m main public`（腾出 main 这个名字）
+3. 生产目录 `git branch -m master main` —— **纯 ref 改名，不碰工作区**，
+   运行中的 DMR 完全不受影响（进程里的模块早已加载，文件一个字节都没变）
+4. `push_all.py`：常量拆成 `DEV_BRANCH` / `PUBLIC_LOCAL` / `PUBLIC_REMOTE`，
+   五处 `ls-tree` / `checkout` / `diff` / `merge` / `rev-list` 全部对齐 `DEV_BRANCH`，
+   推送 refspec 改为 `public:main`；`master_files`→`dev_files`、`master_dirty`→`dev_dirty`
+5. `v5`：`git rev-list --count origin/v5 ^origin/main` = 0，说明**已被 main 完全包含**，
+   是纯历史节点。删分支、留 tag `v5-last`（分支会被后续推进，tag 才是发布位的正确表达）
+6. 远端删 `master`（origin 与 full 各一个），`origin/v5` 删分支
+
+## 五、full 为什么不能删
+
+它看起来像"重复的一份"，实际是唯一的灾难恢复手段：2026-11-16 单测误连生产库、
+孤儿清理删掉 22 个历史场次，就是从 `F:/DanmakuRepo-full` 的快照 ATTACH 合并回来的。
+那里有 `logs/dmr_state.db` 的历史版本、真实 `configs/DMR-*.yml`、`.temp/` 状态 ——
+公开仓库一个都没有，光靠公开仓库恢复不了。只把它远端的 `master` 分支删掉。

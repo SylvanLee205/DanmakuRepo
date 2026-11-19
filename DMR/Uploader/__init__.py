@@ -87,6 +87,10 @@ class Uploader():
                             #     task['config']['files'] = restored_files
                         self.failed_tasks[uuid] = task
                 self.logger.info(f'Loaded {len(self.failed_tasks)} failed upload tasks.')
+                # ⚠️ 曾经想在这里按状态库 UPLOADED 清掉"其实已传成功"的旧失败记录，
+                #    实测行不通：状态库只保留未完结的场次，一场直播全部产物进终态后，
+                #    下次启动对账的 D4 会把整场删掉（"清理场次 N 个"），证据随之消失。
+                #    真正的清理时机是**上传成功那一刻**，见 _forget_failed_for_files。
             except Exception as e:
                 # ⚠️ 2026-11-02：把坏文件挪走，否则每次启动都报同一句错，
                 #    而这份"待重试上传"清单其实已经废了 —— 那些文件既不会被
@@ -115,6 +119,59 @@ class Uploader():
             os.replace(tmp, self.failed_tasks_file)
         except Exception as e:
             self.logger.error(f'Failed to save failed tasks: {e}')
+
+    # ---------------------------------------------------------------- 失败清单自净
+
+    @staticmethod
+    def _norm_path(path) -> str:
+        """把产物路径归一成可比较的形式（分隔符/相对前缀/大小写）。"""
+        if not path:
+            return ''
+        p = str(path).replace('/', os.sep).strip()
+        if p.startswith('.' + os.sep):
+            p = p[2:]
+        try:
+            return os.path.normcase(os.path.normpath(p))
+        except Exception:                                        # noqa: BLE001
+            return p
+
+    def _forget_failed_for_files(self, files) -> None:
+        """同一个文件后来传成功了 → 作废它以前留下的失败记录。
+
+        2026-11-19 实测：目录名 emoji 造成的 14 条失败上传，在「目录名清洗」
+        修好之后由状态库对账补传**全部成功**，但旧记录没人删 —— 每次启动都打印
+        「Loaded 14 failed upload tasks」，WebUI 里也一直挂着待重试；点一下就会
+        把已经在云端的文件（合计 2GB+）重传一遍。和当初「Loaded 5 failed render
+        tasks」是同一种假队列。
+
+        ⚠️ 不能在启动时拿状态库当证据：库只保留未完结的场次，一场直播的产物
+        全部进终态后，下次启动对账会把整场删掉（D4「清理场次 N 个」），
+        证据随之消失 —— 本函数第一版就是因此一条都清不掉。上传成功这一刻
+        按文件路径对账，才是不依赖历史的可靠时机。
+
+        判定保守：一个任务带多个文件时，**全部**命中才算收敛。
+        """
+        if not self.failed_tasks:
+            return
+        done = {self._norm_path(getattr(f, 'path', None)) for f in files}
+        done.discard('')
+        if not done:
+            return
+        settled = []
+        for uid, task in self.failed_tasks.items():
+            paths = {self._norm_path(getattr(f, 'path', None))
+                     for f in (task.get('files') or [])}
+            paths.discard('')
+            if paths and paths <= done:
+                settled.append(uid)
+        if not settled:
+            return
+        for uid in settled:
+            self.failed_tasks.pop(uid, None)
+        self.logger.info(
+            f'作废 {len(settled)} 条同一文件的旧失败上传记录'
+            f'（已传成功，剩余待重试 {len(self.failed_tasks)} 条）。')
+        self.save_failed_tasks()
 
     def retry_task(self, uuid):
         with self._lock:
@@ -340,6 +397,9 @@ class Uploader():
                         # 'config': task['config'],
                     },
                 )
+                # 传成功了就把同一文件的旧失败记录作废，别让 WebUI 里那批
+                # "待重试"永远挂着（点了会把已上传的文件再传一遍）。
+                self._forget_failed_for_files(task.get('files') or [])
 
     def _upload_subprocess(self, task):
         task['status'] = 'uploading'

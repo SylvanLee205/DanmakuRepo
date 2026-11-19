@@ -22,9 +22,12 @@
 | 主程序入口 | `main.py`（`python main.py`） |
 | 外部依赖 | ffmpeg / ffprobe、rclone、biliup、stream-gears、CD2 应用（WebDAV 网盘通道）、Server酱³ |
 
-**发行版 tag 打在 `main`（不是 `master`）**：`main` 含 `configs/global.example.yml`
-等示例配置，别人下载 Source code 就能直接当模板用。`master` 是生产分支，
-不含任何示例配置。**v6.0.0 的 tag 当时打错了（打在 master），已作废不用。**
+**发行版 tag 打在 `public` 分支（推送后即 `origin/main` 的树），不是本地 `main`**：
+`public` 含 `configs/global.example.yml` 等示例配置，别人下载 Source code 就能直接当模板用。
+本地 `main` 是开发主干，不含任何示例配置。**v6.0.0 的 tag 当时打错了（打在旧的生产分支），已作废不用。**
+
+> 2026-11-19 改名：开发主干 `master` → `main`；原公开分支 `main` → `public`。
+> 远端两个仓库现在都只有 `main`。老文档里出现的 "master" 一律指今天的 `main`。
 
 **克隆要看仓库**：公开仓库**不含** `configs/`（用户配置被 .gitignore 排除）、
 不含 `.temp/` 和状态库。要能直接跑起来，克隆**私有仓库**（或公开仓库 + 自己填 `configs/`）。
@@ -329,7 +332,7 @@ python tools\push_all.py            :: 预览（默认）
 python tools\push_all.py --apply    :: 实推：公开 main + 私有完整副本快照
 ```
 
-master 有未提交改动时它会拒绝推。网络不稳时 GitHub 推送可能被代理掐断（TLS eof），
+`main` 有未提交改动时它会拒绝推。网络不稳时 GitHub 推送可能被代理掐断（TLS eof），
 **重试即可**；提交在本地是安全的。验证：`git status -sb` 看 ahead/behind。
 
 ---

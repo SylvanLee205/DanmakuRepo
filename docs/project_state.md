@@ -209,7 +209,7 @@ bilibili/douyu/huya/cc/twitch 弹幕目前都在 `site_class`（类方法）里�
 - **私有仓库** `SylvanLee205/DanmakuRepo-Full` —— 完整副本
   （含 `configs/`、`logs/dmr_state.db`），用于灾难恢复。含主播链接等敏感信息，
   **必须保持 private**。用桌面 `DMR-更新完整副本.bat` 更新。
-- 本地 `master` 保留完整提交历史（56+ 个提交），`main` 是脱敏后的同步分支。
+- 本地 `main` 是开发主干（保留完整提交历史），脱敏后的同步分支是 `public`（推送为 `origin/main`）。
 
 #### 历史上的未提交改动（2026-10-15 记录，多数已处理完毕）
 
