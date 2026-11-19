@@ -203,13 +203,15 @@ bilibili/douyu/huya/cc/twitch 弹幕目前都在 `site_class`（类方法）里�
 
 ### 4.1 Git
 
-- **公开仓库** `SylvanLee205/DanmakuRender`：
-  - `main`（**默认分支**）—— 生产环境代码，基于 v5 叠加实盘修复
-  - `v5` —— 上游发布版基线（已脱敏）
-- **私有仓库** `SylvanLee205/DanmakuRepo-Full` —— 完整副本
+- **公开仓库** `SylvanLee205/DanmakuRepo`：
+  - `main`（**默认分支**）—— 脱敏后的发布树，内容 = 本地 `public` 分支
+    （开发主干 + 10 个发布脚手架：示例配置、脱敏工具）
+- **私有仓库** `SylvanLee205/DanmakuRepo-Full` —— 完整副本（分支同为 `main`）
   （含 `configs/`、`logs/dmr_state.db`），用于灾难恢复。含主播链接等敏感信息，
-  **必须保持 private**。用桌面 `DMR-更新完整副本.bat` 更新。
+  **必须保持 private**。用 `python tools/push_all.py --apply` 或桌面 `DMR-更新完整副本.bat` 更新。
 - 本地 `main` 是开发主干（保留完整提交历史），脱敏后的同步分支是 `public`（推送为 `origin/main`）。
+- 原 `v5` 分支已于 2026-11-19 删除 —— 它的提交全部包含在 `main` 里，
+  末端位置留有 tag `v5-last`，发布点仍是 tag `v5.1.0`。
 
 #### 历史上的未提交改动（2026-10-15 记录，多数已处理完毕）
 
